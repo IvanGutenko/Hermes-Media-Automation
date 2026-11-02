@@ -1,0 +1,7 @@
+[Unit]
+Description=Publish to platforms every ten minutes
+[Timer]
+OnCalendar=*-*-* *:05/10:20
+Persistent=false
+[Install]
+WantedBy=timers.target

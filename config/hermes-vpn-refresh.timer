@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh Hermes VPN subscriptions every six hours
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=6h
+
+[Install]
+WantedBy=timers.target

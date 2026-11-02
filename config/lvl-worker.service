@@ -1,0 +1,21 @@
+[Unit]
+Description=LVL series: render the next episode and publish due language slots
+After=network-online.target hermes-vpn.service
+Wants=hermes-vpn.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/gut/hermes-workspace/video_factory
+Environment=PYTHONPATH=/home/gut/hermes-workspace/video_factory/scripts
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=LVL_TTS_PROXY=http://127.0.0.1:17890
+# Long episode prompts time out the Antigravity CLI (300 s); the API models answer in seconds, so try them first.
+Environment=MEDIA_TEXT_LLM_ORDER=openrouter,groq,agy
+# Text-model keys and LVL_BOT_TOKEN live in the Hermes environment file.
+EnvironmentFile=%h/.hermes/.env
+ExecStart=/home/gut/hermes-workspace/tg_autoposter/.venv/bin/python -u /home/gut/hermes-workspace/video_factory/scripts/lvl_worker.py
+TimeoutStartSec=3300
+Nice=15
+CPUWeight=40
+UMask=0022

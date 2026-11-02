@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the private EOS VPN subscription
+After=hermes-vpn.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/hermes-workspace/tools/vpn_manager.py refresh
+TimeoutStartSec=3min
+UMask=0077
+NoNewPrivileges=yes

@@ -1,0 +1,17 @@
+[Unit]
+Description=Private VPN egress for Hermes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/mihomo -d %h/.config/hermes-vpn -f %h/.config/hermes-vpn/config.yaml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/hermes-vpn
+
+[Install]
+WantedBy=default.target

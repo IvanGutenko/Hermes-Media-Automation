@@ -1,0 +1,37 @@
+services:
+  n8n:
+    image: docker.io/n8nio/n8n:latest
+    container_name: video_factory_n8n
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://100.83.195.10:5678/
+      - GENERIC_TIMEZONE=Europe/Moscow
+      - TZ=Europe/Moscow
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./output:/data/output
+
+  browser:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: video_factory_browser
+    restart: unless-stopped
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Moscow
+      - CHROME_CLI=--remote-debugging-address=0.0.0.0 --remote-debugging-port=9222 https://vids.google.com
+    volumes:
+      - ./browser_profile:/config
+      - ./output:/output
+    ports:
+      - "127.0.0.1:3000:3000"  # Web UI (open in browser to log into Google)
+      - "127.0.0.1:9222:9222"  # CDP (Playwright connects here for automation)
+    shm_size: "2gb"

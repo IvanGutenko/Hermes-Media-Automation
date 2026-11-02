@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare missing editorial post images using the persisted Google session
+After=network-online.target hermes-vpn.service
+Wants=hermes-vpn.service
+[Service]
+Type=oneshot
+WorkingDirectory=/home/gut/hermes-workspace/video_factory
+Environment=PYTHONPATH=/home/gut/hermes-workspace/video_factory/scripts
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+ExecStart=/home/gut/hermes-workspace/tg_autoposter/.venv/bin/python -u /home/gut/hermes-workspace/video_factory/scripts/media_images_worker.py
+TimeoutStartSec=900
+UMask=0077

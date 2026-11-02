@@ -1,0 +1,20 @@
+# Core
+telethon>=1.34.0
+python-telegram-bot>=21.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+openai>=1.30.0
+
+# Embeddings (опционально, для семантического дедупа)
+# sentence-transformers>=3.0.0
+# torch>=2.0.0
+
+# Utils
+numpy>=1.24.0
+tqdm>=4.66.0
+
+# Dev (опционально)
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
+# black>=24.0.0
+# ruff>=0.4.0

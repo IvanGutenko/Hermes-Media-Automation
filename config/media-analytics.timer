@@ -1,0 +1,7 @@
+[Unit]
+Description=Measure published media hourly; retry incomplete collection every fifteen minutes
+[Timer]
+OnCalendar=*-*-* *:0/15:35
+Persistent=true
+[Install]
+WantedBy=timers.target

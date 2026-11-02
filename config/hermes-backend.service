@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes backend for the desktop client over Tailscale
+Requires=hermes-vpn.service
+After=network-online.target hermes-vpn.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/hermes-workspace
+EnvironmentFile=%h/.hermes/.env
+ExecStart=%h/.local/bin/hermes serve --host 100.83.195.10 --port 9119
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

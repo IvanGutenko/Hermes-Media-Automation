@@ -1,0 +1,4 @@
+# Fill with your own Telegram sources before starting the collector.
+source_channels: []
+promotion:
+  enabled: false

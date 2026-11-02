@@ -1,0 +1,11 @@
+[Unit]
+Description=Send the owner a Telegram summary of what the media factory did
+[Service]
+Type=oneshot
+WorkingDirectory=/home/gut/hermes-workspace/video_factory
+Environment=PYTHONPATH=/home/gut/hermes-workspace/video_factory/scripts
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+ExecStart=/home/gut/hermes-workspace/tg_autoposter/.venv/bin/python -u /home/gut/hermes-workspace/video_factory/scripts/owner_notify.py digest 12
+TimeoutStartSec=120
+UMask=0077

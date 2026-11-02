@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Gemini through the selected VPN and switch if needed
+Requires=hermes-vpn.service
+After=hermes-vpn.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/hermes-workspace/tools/vpn_manager.py check
+TimeoutStartSec=25min
+UMask=0077
+NoNewPrivileges=yes

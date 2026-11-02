@@ -1,0 +1,4 @@
+name: approved-free-providers
+version: 1.0.0
+description: Explicit Groq and zero-price OpenRouter model choices
+category: model-providers

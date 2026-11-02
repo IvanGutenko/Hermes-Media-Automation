@@ -1,0 +1,5 @@
+name: personal-antigravity-cli
+kind: model-provider
+version: 0.1.0
+description: Official Google Antigravity CLI as a Gemini backend for Hermes
+author: Personal setup

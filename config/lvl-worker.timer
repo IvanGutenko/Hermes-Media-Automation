@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the LVL schedule every ten minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

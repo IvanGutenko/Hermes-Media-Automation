@@ -1,0 +1,9 @@
+[Unit]
+Description=Hourly browser pass for audience numbers the APIs do not expose
+
+[Timer]
+OnCalendar=*-*-* *:40:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
