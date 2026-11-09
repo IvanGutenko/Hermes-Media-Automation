@@ -87,6 +87,8 @@ def parse_subscription(data, prefix):
 
 
 def configuration(providers, secret):
+    if any(name.casefold() == "taynik" for name in providers):
+        raise ValueError("Retired VPN provider is not permitted")
     uses = list(providers.keys())
     health = {'url': 'https://www.gstatic.com/generate_204', 'interval': 120,
               'lazy': False, 'timeout': 6000, 'expected-status': 204}
@@ -129,7 +131,7 @@ def configuration(providers, secret):
         'proxy-groups': [
             {'name': 'PROBE', 'type': 'select', 'use': uses},
             # Verified working nodes for Google Antigravity Code Assist:
-            # Germany 6, Germany 5, Finland 1, and Taynik AI.
+            # Germany 6, Germany 5, and Finland 1.
             {'name': 'ANTIGRAVITY', 'type': 'select', 'proxies': ['REJECT'],
               'use': uses},
             # Browser eligibility is checked independently of Code Assist.
@@ -202,7 +204,7 @@ def configuration(providers, secret):
             'DOMAIN-SUFFIX,alkalimakersuite-pa.googleapis.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,aicode.googleapis.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,antigravity-unleash.goog,ANTIGRAVITY',
-            'DOMAIN-SUFFIX,googleapis.com,ANTIGRAVITY',
+            'DOMAIN-SUFFIX,googleapis.com,GEMINI',
             'DOMAIN-SUFFIX,gemini.google.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,aistudio.google.com,ANTIGRAVITY',
             'GEOSITE,google,ANTIGRAVITY',
@@ -214,7 +216,7 @@ def configuration(providers, secret):
             'DOMAIN-SUFFIX,anthropic.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,claude.ai,ANTIGRAVITY',
             'GEOSITE,anthropic,ANTIGRAVITY',
-            'DOMAIN-SUFFIX,groq.com,ANTIGRAVITY',
+            'DOMAIN-SUFFIX,groq.com,AI',
             'DOMAIN-SUFFIX,openrouter.ai,ANTIGRAVITY',
             'DOMAIN-SUFFIX,deepseek.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,opencode.ai,ANTIGRAVITY',
@@ -244,9 +246,10 @@ def configuration(providers, secret):
             'DOMAIN-SUFFIX,reddit.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,redd.it,ANTIGRAVITY',
             'GEOSITE,reddit,ANTIGRAVITY',
-            'DOMAIN-SUFFIX,telegram.org,ANTIGRAVITY',
-            'DOMAIN-SUFFIX,t.me,ANTIGRAVITY',
-            'GEOSITE,telegram,ANTIGRAVITY',
+            'DOMAIN-SUFFIX,telegram.org,AI',
+            'DOMAIN-SUFFIX,t.me,AI',
+            'DOMAIN-SUFFIX,telesco.pe,AI',
+            'GEOSITE,telegram,AI',
             'DOMAIN-SUFFIX,g2.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,capterra.com,ANTIGRAVITY',
             'DOMAIN-SUFFIX,notion.so,ANTIGRAVITY',

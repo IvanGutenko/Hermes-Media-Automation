@@ -1,10 +1,19 @@
-import sys,unittest
+import asyncio,sys,unittest
+from unittest.mock import patch
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 from reddit_publisher import post_id,blocks_new_submission,matches_uploaded_image,min_loaded_size,loaded_at_source_size
+import reddit_publisher
 
 
 class RedditAcknowledgementTests(unittest.TestCase):
+    def test_retired_worker_never_opens_the_browser_for_submit_or_readback(self):
+        with patch.object(reddit_publisher,'connect') as connect:
+            for read_only in (False,True):
+                result=asyncio.run(reddit_publisher.publish('/data/output/old-job.json',read_only))
+                self.assertEqual(result,{'status':'disabled','platform':'reddit','reason':'disabled_by_owner'})
+            connect.assert_not_called()
+
     def test_reddit_responsive_photo_is_identified_by_uploaded_media_id(self):
         photo={'src':'https://preview.redd.it/title-v0-9nm1l90qmjyh1.jpeg?width=640',
             'complete':True,'width':640,'height':357,'display_width':577,'display_height':322}

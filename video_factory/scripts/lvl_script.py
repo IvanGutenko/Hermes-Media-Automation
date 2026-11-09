@@ -152,8 +152,20 @@ def pick_topic(rubric=None, exclude=()):
     history = lvl_topics.used()
     counts = {r: 0 for r in lvl_topics.RUBRICS}
     for h in history[-20:]:counts[h.get('rubric')] = counts.get(h.get('rubric'), 0) + 1
-    rubric = rubric or min(counts, key=lambda r: (counts[r], r))
+    from growth_actions import choose_rubric
+    rubric = rubric or choose_rubric(counts)
     phrases = lvl_topics.demand(rubric)
+    # Researched demand adds specific questions to the real suggestion pool;
+    # primary-source evidence is still collected and checked independently.
+    from growth_scout import ROOT as scout_root, load as scout_load
+    researched = scout_load(scout_root/'lvl.json')
+    if 0 <= time.time()-researched.get('updated_at',0) <= 7*86400:
+        for idea in researched.get('ideas',[]):
+            if idea.get('rubric') != rubric:continue
+            for language in ('ru','en'):
+                query = idea.get('query_'+language,'')
+                for rank, phrase in enumerate(lvl_topics.suggest(query,language)[:4]):
+                    phrases.append({'phrase':phrase,'lang':language,'seed':query,'rank':rank,'scout_idea':idea['id']})
     if not phrases:raise ScriptError('no demand data (search suggestions unreachable)')
     seen, pool = set(), []
     for p in phrases:
@@ -161,7 +173,7 @@ def pick_topic(rubric=None, exclude=()):
         seen.add(p['phrase'])
         p['novelty'] = lvl_topics.novelty(p['phrase'], history)
         if p['novelty'] >= 0.55:pool.append(p)
-    pool = sorted(pool, key=lambda p: (p['rank'], -p['novelty']))[:40]
+    pool = sorted(pool, key=lambda p: (not bool(p.get('scout_idea')),p['rank'], -p['novelty']))[:40]
     if not pool:raise ScriptError('every candidate phrase is already covered')
     trend = lvl_topics.trending('US', 12)
     msg = (f"Rubric: {rubric} ({lvl_topics.RUBRICS[rubric]['en']}). Pick ONE topic for a 40-second cartoon explainer from these real YouTube search phrases (rank 0 = most searched). "
@@ -174,6 +186,7 @@ def pick_topic(rubric=None, exclude=()):
     data, model = _llm([{'role': 'system', 'content': 'You choose evidence-friendly topics for a series. Return JSON only.'}, {'role': 'user', 'content': msg}], 0.5)
     if not all(data.get(k) for k in ('phrase', 'title_en', 'title_ru', 'evidence_query_en')):raise ScriptError('topic answer incomplete')
     data['phrase'] = clean_phrase(data['phrase'], [p['phrase'] for p in pool])
+    if data['phrase'] not in [p['phrase'] for p in pool]:raise ScriptError('topic phrase was not present in the measured demand pool')
     return {**{k: data[k] for k in ('phrase', 'title_en', 'title_ru', 'evidence_query_en')}, 'broad_query_en': str(data.get('broad_query_en') or ''),
         'angle': data.get('angle', ''), 'rubric': rubric, 'model': model}
 
@@ -282,7 +295,9 @@ def write_episode(topic, evidence, cast=None, previous=None, attempts=3):
         f"RECENT EPISODES (do not repeat their premise):\n{recent or '- none yet'}\n\nEVIDENCE (the only source of facts):\n{ev}\n\nJSON SCHEMA:\n{SCHEMA}\n"
         f"Length: all Russian lines together {MIN_WORDS['ru']}-{MAX_WORDS['ru']} words (aim for {TARGET_WORDS['ru']}), all English lines together {MIN_WORDS['en']}-{MAX_WORDS['en']} words "
         f"(aim for {TARGET_WORDS['en']}); that is about 9-11 words per scene, so write full sentences, not slogans. Count the words before answering. 7-9 scenes. Scene 1 is the hook.")
-    messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': user}]
+    import growth_actions
+    editorial = growth_actions.context('lvl')
+    messages = [{'role': 'system', 'content': SYSTEM + editorial['prompt']}, {'role': 'user', 'content': user}]
     last = ''
     for attempt in range(attempts):
         data, model = _llm(messages, 0.8 if attempt == 0 else 0.5)
@@ -298,7 +313,10 @@ def write_episode(topic, evidence, cast=None, previous=None, attempts=3):
             continue
         if ok:
             episode['model'] = model
+            episode['growth_actions'] = editorial['receipt']
             episode['evidence'] = [{k: e[k] for k in ('id', 'source', 'title', 'year', 'journal', 'url')} for e in evidence if e['id'] in {c['evidence'] for c in episode['claims']}]
+            growth_actions.record('lvl', 'episode_script', editorial['receipt'], title=episode['title_en'],
+                rubric=topic['rubric'], actions_status='included_in_fact_reviewed_script')
             return episode
         last = 'fact review: ' + '; '.join(problems)
         messages += [{'role': 'assistant', 'content': json.dumps(data, ensure_ascii=False)[:6000]},

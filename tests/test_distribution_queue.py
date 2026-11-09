@@ -21,11 +21,18 @@ class Base(unittest.TestCase):
     def run_dir(self,run_id,brand,age_hours):
         folder=self.root/'output/runs'/run_id;folder.mkdir()
         (folder/'manifest.json').write_text(json.dumps({'run_id':run_id,'brand':brand,'status':'published','youtube_url':'https://youtu.be/x',
+            'visual_mode':'hybrid','motion_system':'editorial-v2','scenes':[{'visual_type':'motion'},{'visual_type':'hybrid'}],
             'completed_at':time.time()-age_hours*3600,'video':str(folder/'short.mp4')}))
         (folder/'script.json').write_text(json.dumps({'youtube_meta':{'title':'T '+run_id,'description':'D'}}))
 
 
 class VideoQueue(Base):
+    def test_legacy_backlog_is_preserved_but_no_longer_sent_under_the_new_owner_style_policy(self):
+        self.conf(video_interval_seconds=0);self.run_dir('old-style','wrongdev',1);self.run_dir('hybrid','wrongdev',2)
+        path=self.root/'output/runs/old-style/manifest.json';old=json.loads(path.read_text());old.pop('motion_system');path.write_text(json.dumps(old))
+        publish=Mock(return_value={'status':'scheduled'});self.go(publish)
+        self.assertEqual(publish.call_args.args[2]['source_id'],'video-hybrid')
+        self.assertEqual(json.loads(path.read_text()),old)
     def conf(self,**pcfg):
         self.config.write_text(json.dumps({'wrongdev':{'publishing':{'instagram':{'enabled':True,'target':'acct','video_enabled':True,**pcfg}}}}))
     def go(self,publish):
@@ -91,6 +98,13 @@ class VideoQueue(Base):
         with patch.object(d,'publish',publish),patch.object(video_quality,'require_artifact',return_value=None):d.distribute_videos([2])
         self.assertEqual(publish.call_count,2)
 
+    def test_retired_reddit_is_skipped_even_with_a_stale_enabled_config(self):
+        self.config.write_text(json.dumps({'wrongdev':{'publishing':{p:{'enabled':True,'target':p,'video_enabled':True,'video_interval_seconds':0} for p in ('vk','instagram','tiktok','reddit')}}}))
+        self.run_dir('r1','wrongdev',2)
+        publish=Mock(return_value={'status':'published','url':'u'})
+        self.go(publish)
+        self.assertEqual([call.args[1] for call in publish.call_args_list],['vk','instagram','tiktok'])
+
 
 class Lease(Base):
     def test_publisher_waits_for_the_browser_and_marks_itself_waiting(self):
@@ -127,6 +141,15 @@ class CheapTick(unittest.TestCase):
         self.write({'next_due':10000,'job':'j','retry_after':2000});self.assertTrue(media_worker.nothing_due(self.root,now=1000))
         self.write({'next_due':10000,'job':'j','retry_after':500});self.assertFalse(media_worker.nothing_due(self.root,now=1000))
         self.write({'next_due':2000});self.assertFalse(media_worker.nothing_due(self.root,now=1000))
+    def test_repeated_browser_demand_cannot_keep_an_overdue_video_out_forever(self):
+        import os
+        (self.root/'output').mkdir();marker=self.root/'output/.publisher-waiting';marker.touch()
+        os.utime(marker,(4000,4000))
+        self.write({'next_due':5000})
+        self.assertTrue(media_worker.publisher_is_waiting(self.root,now=4000))
+        self.write({'next_due':1000,'job':'retained'})
+        self.assertFalse(media_worker.publisher_is_waiting(self.root,now=4000))
+
     def test_any_doubt_runs_the_full_tick(self):
         self.assertFalse(media_worker.nothing_due(self.root,now=1000))
 

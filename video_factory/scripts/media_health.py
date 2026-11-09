@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 from script_generator import BASE_DIR
 from youtube_uploader import save
+from platform_policy import DISABLED_PLATFORMS
 
 
 BUSY_RESTART_FAILURES=6
@@ -47,69 +48,30 @@ PARK_URL='https://myaccount.google.com/'
 
 
 def park_idle_browser():
-    """Park Flow's landing tab on a static Google page and drop spare duplicate tabs; returns how many were touched.
-
-    Flow's start page animates without end. Measured while nothing ran: 92% for its renderer
-    and 79% for the software GPU process, of this host's two cores, starving every other
-    service. myaccount.google.com keeps the same signed-in session at under 9% in total.
-    Call it only under the global generation lease. A /project/ page may hold a generation
-    in flight, so only non-project Flow pages are navigated away.
-
-    Instagram and TikTok pages are parked too: a publisher leaves its tab on the autoplaying
-    feed, and measured on 2026-11-01 that one software-rendered renderer used 69% of a core
-    (74 CPU minutes) for hours while nothing was posting. Publishers navigate on their own.
-
-    Spare tabs are closed: every Flow request that stays retained leaves its project tab, and the editor
-    tab it ended on is never reused (the next job looks for the /project/ path), so these accumulate;
-    each costs a 270-400 MB renderer on a 4.9 GB host. A /project/ page is always kept, and so is one
-    myaccount tab, so the browser never loses its last window.
-
-    Nothing is touched while someone is connected to the desktop (noVNC): the owner logging in to a
-    new YouTube or Instagram account must not have the page moved under their hands."""
+    """Run the same orphan-tab recovery used by each leased browser job."""
     from browser_process import run
-    code='''import asyncio
-from urllib.parse import urlsplit
-from playwright.async_api import async_playwright
-SOCIAL=('instagram.com','tiktok.com')
-def owner_connected():
- for name in ('/proc/net/tcp','/proc/net/tcp6'):
-  try:rows=open(name).read().splitlines()[1:]
-  except OSError:continue
-  for row in rows:
-   cols=row.split()
-   if len(cols)>3 and cols[1].endswith(':170C') and cols[3]=='01':return True
- return False
+    code='''import asyncio,sys
+sys.path.insert(0,'/app/scripts')
+from browser_tabs import tidy,http_tidy
 async def main():
- if owner_connected():print(0);return
+ try:bootstrap=await asyncio.wait_for(asyncio.to_thread(http_tidy),15)
+ except Exception:bootstrap={}
+ from playwright.async_api import async_playwright
  async with async_playwright() as p:
   b=await p.chromium.connect_over_cdp('http://127.0.0.1:9222',timeout=10000)
-  parked=0
-  try:
-   pages=list(b.contexts[0].pages)
-   for page in pages:
-    if page.url.startswith('https://myaccount.google.com'):
-     try:await asyncio.wait_for(page.bring_to_front(),5)
-     except Exception:pass
-     break
-   spare=[]
-   if any(urlsplit(x.url).netloc=='flow.google.com' and '/project/' in urlsplit(x.url).path and '/edit/' not in urlsplit(x.url).path for x in pages):
-    spare+=[x for x in pages if urlsplit(x.url).netloc=='flow.google.com' and '/edit/' in urlsplit(x.url).path]
-   accounts=[x for x in pages if urlsplit(x.url).netloc=='myaccount.google.com']
-   spare+=accounts[1:]
-   for page in pages:
-    u=urlsplit(page.url)
-    if page in spare:
-     await asyncio.wait_for(page.close(),5);parked+=1
-    elif (u.netloc=='flow.google.com' and '/project/' not in u.path) or u.netloc.endswith(SOCIAL):
-     await asyncio.wait_for(page.goto('@PARK@',wait_until='commit'),20);parked+=1
-  finally:
-   await asyncio.wait_for(b.close(),3)
-  print(parked)
-asyncio.run(main())'''.replace('@PARK@',PARK_URL)
+  try:report=await tidy(b.contexts[0])
+  finally:await asyncio.wait_for(b.close(),3)
+  print(report['touched_count']+bootstrap.get('closed_count',0))
+asyncio.run(main())'''
     try:
         result=run(['docker','exec','video_factory_auth','python3','-c',code],capture_output=True,text=True,timeout=60)
+        save(BASE_DIR/'output/browser_cleanup_attempt.json',{'checked_at':time.time(),'returncode':result.returncode,
+            'error':result.stderr[-1800:] if result.returncode else None})
         return int(result.stdout.strip().splitlines()[-1]) if result.returncode==0 and result.stdout.strip() else 0
-    except (subprocess.TimeoutExpired,ValueError):return 0
+    except (subprocess.TimeoutExpired,ValueError) as exc:
+        save(BASE_DIR/'output/browser_cleanup_attempt.json',{'checked_at':time.time(),'error':type(exc).__name__})
+        return 0
+
 
 
 def unfinished_studio_uploads():
@@ -119,6 +81,14 @@ def unfinished_studio_uploads():
 
 def tick():
     now=time.time();problems=[]
+    # Release disposable renderers BEFORE the new-tab readiness probe. Under
+    # memory pressure Chrome can enumerate old tabs but cannot create a test
+    # tab; gating cleanup on that probe prevents it from ever recovering.
+    parked=0
+    with (BASE_DIR/'output/.flow-generation.lock').open('r') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:pass
+        else:parked=park_idle_browser()
     from media_network import check as network_check
     try:
         network=network_check()
@@ -131,15 +101,35 @@ def tick():
     schedule=json.loads((BASE_DIR/'data/media_schedule.json').read_text())
     for brand,settings in cfg.items():
         for platform,target in settings.get('publishing',{}).items():
-            if target.get('moderation_hold'):
+            if target.get('moderation_hold') and platform not in DISABLED_PLATFORMS:
                 problems.append({'brand':brand,'platform':platform,'issue':'platform_moderation_hold',
                     'reason':target['moderation_hold'].get('reason')})
     for brand,settings in cfg.items():
         if not settings.get('video_enabled'):continue
         slot=schedule.get(brand,{})
         if now>slot.get('next_due',now)+1800:
+            job=BASE_DIR/'output/runs'/str(slot.get('job') or '')/'manifest.json'
+            manifest=json.loads(job.read_text()) if job.exists() else {}
             problems.append({'brand':brand,'issue':'publication_overdue','seconds':int(now-slot['next_due']),
-                'job':slot.get('job'),'error':slot.get('error')})
+                'job':slot.get('job'),'job_status':manifest.get('status'),
+                'job_updated_at':job.stat().st_mtime if job.exists() else None,
+                'error':manifest.get('error') if manifest else slot.get('error'),
+                'last_error':slot.get('error')})
+    # LVL has its own worker and per-account RU/EN cadence, rather than the
+    # news worker's schedule. Its disabled news-worker flag is not a video stop.
+    lvl=cfg.get('lvl',{})
+    if lvl.get('lvl_enabled') and lvl.get('publish_interval_seconds'):
+        from lvl_worker import interval_history,enabled_platforms
+        entries=[(p,json.loads(p.read_text())) for p in (BASE_DIR/'output/lvl_runs').glob('*/manifest.json')]
+        worker_path=BASE_DIR/'data/lvl/worker.json'
+        worker=json.loads(worker_path.read_text()) if worker_path.exists() else {}
+        for platform in enabled_platforms(lvl):
+            latest,_=interval_history(lvl,entries,platform)
+            interval=lvl['publishing'][platform].get('video_interval_seconds',lvl['publish_interval_seconds'])
+            if latest and now>latest+interval+1800:
+                problems.append({'brand':'lvl','platform':platform,'issue':'publication_overdue',
+                    'seconds':int(now-latest-interval),'last_published_at':latest,
+                    'job_status':'producing_or_waiting_for_ready_episode','error':worker.get('last_produce_error')})
     for unit in ('tg-autoposter.service','video-autoposter.timer','media-research.timer','media-distribution.timer','media-images.timer','media-analytics.timer'):
         active=subprocess.run(['systemctl','--user','is-active',unit],capture_output=True,text=True).stdout.strip()
         if active!='active':
@@ -165,6 +155,7 @@ def tick():
     holds=BASE_DIR/'data/distribution/target_holds.json'
     if holds.exists():
         for key,value in json.loads(holds.read_text()).items():
+            if key.split(':',1)[0] in DISABLED_PLATFORMS:continue
             if value.get('until',0)>now and value.get('fails',0)>=3:
                 problems.append({'issue':'platform_account_failing','target':key,'fails':value['fails'],
                     'needs_login':value.get('needs_login'),'reason':str(value.get('reason'))[-200:]})
@@ -173,6 +164,11 @@ def tick():
         value=json.loads(path.read_text())
         if value.get('status')=='publishing' and now-value.get('publish_requested_at',now)>1800:
             problems.append({'issue':'photo_publication_unverified','source_id':value['source_id']})
+    for path in (BASE_DIR/'data/distribution').glob('*_telegram_*.json'):
+        value=json.loads(path.read_text())
+        if value.get('status')=='sending' and now-value.get('send_requested_at',path.stat().st_mtime)>1800:
+            problems.append({'issue':'telegram_publication_unverified','source_id':value.get('source_id'),
+                'recovery':'source retained for automatic readback; newer topics follow their own cadence'})
     for platform in ('instagram','tiktok'):
         for path in (BASE_DIR/'output').glob('native_'+platform+'_*.json'):
             if not re.fullmatch(r'native_'+platform+r'_[a-f0-9]{64}\.json',path.name):continue
@@ -183,7 +179,6 @@ def tick():
                     'reason':value.get('last_error')})
     # Restart a dead browser only with the same global lease used by generators.
     # The persistent profile survives the container restart.
-    parked=0
     with (BASE_DIR/'output/.flow-generation.lock').open('r') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
@@ -204,7 +199,6 @@ def tick():
                 if not ready:
                     problems.append({'issue':'browser_attachment_unavailable','consecutive_failures':failures})
                     unavailable=failures>=(BUSY_RESTART_FAILURES if stalled else 2)
-                elif time.time()-now<75:parked=park_idle_browser()
             # We hold the lease, so no upload is running now. A saved upload can wait for a short failure, but a hung Chrome
             # can never finish it (measured 2026-11-02: every publisher failed until a manual restart), and its receipt survives.
             if unavailable and unfinished_studio_uploads() and failures<BUSY_RESTART_FAILURES:

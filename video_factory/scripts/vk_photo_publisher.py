@@ -96,19 +96,41 @@ async def editor_text(box):
     }''')
 
 
-async def clear_published_draft(page,box,group):
+def is_owned_residual(old,group,current,now):
+    if old.get('group_id')!=group or normalized(old.get('text',''))!=current:return False
+    if not re.fullmatch(r'[a-f0-9]{64}',old.get('key','')):return False
+    if old.get('status')=='published':return bool(old.get('public_verified_at'))
+    attempted=old.get('publish_requested_at')
+    return (old.get('status')=='publishing' and isinstance(attempted,(int,float))
+        and now-attempted>12*3600 and bool(old.get('sha256'))
+        and old.get('image_uploaded_sha256')==old['sha256'])
+
+
+async def clear_owned_residual_draft(page,box,group):
     current=normalized(await editor_text(box))
     for path in ROOT.glob('native_vk_photo_*.json'):
         if not re.fullmatch(r'native_vk_photo_[a-f0-9]{64}\.json',path.name):continue
         old=json.loads(path.read_text())
-        if (old.get('status')!='published' or old.get('group_id')!=group or not old.get('public_verified_at')
-                or normalized(old.get('text',''))!=current):continue
-        # The full draft is already published and independently read back. It is
-        # an agent-created residual, not an unknown owner draft.
+        if not is_owned_residual(old,group,current,time.time()):continue
+        job_path=ROOT/('vk_photo_job_'+old['key']+'.json')
+        if not job_path.exists():continue
+        frozen=json.loads(job_path.read_text())
+        if any(frozen.get(k)!=old.get(k) for k in ('key','source_id','group_id','text','sha256','image')):continue
+        image=Path(old.get('image','')).resolve()
+        if ROOT not in image.parents or not image.is_file() or hashlib.sha256(image.read_bytes()).hexdigest()!=old['sha256']:continue
+        # A failed, old send can leave our exact frozen post in the composer.
+        # Archive that residue before clearing it, preserving its uncertain
+        # publication receipt. Never resend it or call it published.
+        archive=ROOT/('vk_residual_draft_'+old['key']+'_'+str(time.time_ns()))
+        evidence={'receipt':str(path),'status':old['status'],'source_id':old.get('source_id'),
+            'text':await editor_text(box),'snapshot':await box.aria_snapshot(),
+            'image':str(image),'sha256':old['sha256'],'archived_at':time.time()}
+        save(archive.with_suffix('.json'),evidence)
+        await page.screenshot(path=str(archive.with_suffix('.png')))
         await page.keyboard.press('Escape')
         await page.get_by_role('button',name=re.compile(r'Выйти\s+без\s+сохранения')).click(timeout=15000)
         await box.wait_for(state='hidden')
-        old.update(residual_draft_discarded_at=time.time());save(path,old)
+        old.update(residual_draft_discarded_at=time.time(),residual_draft_archive=str(archive.with_suffix('.json')));save(path,old)
         return True
     return False
 
@@ -136,7 +158,7 @@ async def publish(job_path,preview=False):
                     box=page.get_by_test_id('posting_base_screen_input_message');await box.wait_for()
                     current=normalized(await editor_text(box))
                     if current and current!=normalized(job['text']):
-                        if not await clear_published_draft(page,box,job['group_id']):
+                        if not await clear_owned_residual_draft(page,box,job['group_id']):
                             raise RuntimeError('VK composer has another unfinished draft; preserved')
                         await page.get_by_role('button',name='Создать',exact=True).click()
                         await page.get_by_role('dialog').get_by_text('Пост',exact=True).click()

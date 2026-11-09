@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import content_feedback as cf
 import host_load
 import media_health as health
+import browser_tabs
 
 NOW = 1_800_000_000
 CALM = {'available_mib': 2200, 'memory_pressure': 1.0, 'io_pressure': 5.0}
@@ -68,7 +69,7 @@ class RotationTests(unittest.TestCase):
         due = cf.due_platforms(self.ITEMS, state, NOW, limit=9)
         self.assertNotIn('vk', due)
         self.assertNotIn('dzen', due)
-        self.assertEqual(set(due), {'reddit', 'tiktok', 'instagram'})
+        self.assertEqual(set(due), {'tiktok', 'instagram'})
 
     def test_a_failed_reading_is_retried_after_an_hour_not_at_the_next_pass_and_not_after_six(self):
         failed = {'instagram': {'tried': NOW - 1800, 'ok': False}}
@@ -78,7 +79,7 @@ class RotationTests(unittest.TestCase):
 
     def test_a_platform_without_published_items_is_never_opened(self):
         self.assertEqual(cf.due_platforms([item('telegram')], {}, NOW), [])
-        self.assertEqual(cf.due_platforms([item('reddit'), item('dzen')], {}, NOW, limit=9), ['dzen', 'reddit'])
+        self.assertEqual(cf.due_platforms([item('reddit'), item('dzen')], {}, NOW, limit=9), ['dzen'])
 
     def test_readings_of_waiting_platforms_stay_visible_but_marked_stale_until_two_intervals_pass(self):
         previous = [
@@ -160,11 +161,15 @@ class FakePage:
         self.log.append(('goto', self.url, url))
         self.url = url
 
+    async def evaluate(self,*_):return getattr(self,'visible',True)
 
-def run_tidy(urls, vnc_clients=0):
+
+def run_tidy(urls, vnc_clients=0,visible_urls=None):
     """Executes the exact script media_health sends into the browser container against fake pages."""
     log = []
     pages = [FakePage(u, log) for u in urls]
+    if visible_urls is not None:
+        for page in pages:page.visible=page.url in visible_urls
     browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(pages=pages)])
 
     async def close():
@@ -201,7 +206,8 @@ def run_tidy(urls, vnc_clients=0):
     with patch('browser_process.run', side_effect=fake_run):
         health.park_idle_browser()
     with patch.dict(sys.modules, {'playwright': types.ModuleType('playwright'), 'playwright.async_api': api}), \
-            patch('sys.stdout', out):
+            patch('sys.stdout', out),patch.object(browser_tabs,'owner_connected',return_value=bool(vnc_clients)), \
+            patch.object(browser_tabs,'http_tidy',return_value={'closed_count':0}):
         exec(compile(captured['code'], '<container script>', 'exec'), {'__name__': '__main__', 'open': fake_open})
     return log, int(out.getvalue().strip().splitlines()[-1])
 
@@ -222,9 +228,9 @@ class TidyTests(unittest.TestCase):
         self.assertEqual(log, [])
         self.assertEqual(count, 0)
 
-    def test_instagram_and_tiktok_are_parked_and_the_flow_landing_page_too(self):
+    def test_unused_social_tabs_are_closed_and_flow_landing_is_parked(self):
         log, count = run_tidy([ACCOUNT, 'https://www.instagram.com/reels/abc/', 'https://www.tiktok.com/@x', 'https://flow.google.com/u/0/'])
-        self.assertEqual([entry[:2] for entry in log], [('goto', 'https://www.instagram.com/reels/abc/'), ('goto', 'https://www.tiktok.com/@x'), ('goto', 'https://flow.google.com/u/0/')])
+        self.assertEqual([entry[:2] for entry in log], [('close', 'https://www.instagram.com/reels/abc/'), ('close', 'https://www.tiktok.com/@x'), ('goto', 'https://flow.google.com/u/0/')])
         self.assertEqual(count, 3)
 
     def test_the_last_window_is_never_closed(self):
@@ -236,10 +242,76 @@ class TidyTests(unittest.TestCase):
         self.assertEqual(log, [])
         self.assertEqual(count, 0)
 
-    def test_other_pages_such_as_studio_and_login_forms_are_left_alone(self):
+    def test_completed_dashboards_are_discarded_but_login_and_upload_editors_are_preserved(self):
         log, _ = run_tidy([ACCOUNT, 'https://studio.youtube.com/channel/UC1', 'https://www.youtube.com/channel_switcher', 'https://vk.ru/club1'])
-        self.assertEqual(log, [])
+        self.assertEqual(log,[('close','https://studio.youtube.com/channel/UC1'),('close','https://vk.ru/club1')])
+        protected=['https://accounts.google.com/v3/signin/challenge',
+            'https://www.instagram.com/accounts/login/', 'https://studio.youtube.com/video/abc/edit',
+            'https://dzen.ru/profile/editor/article/unfinished']
+        log,_=run_tidy([ACCOUNT]+protected)
+        self.assertEqual(log,[])
+
+    def test_duplicate_retained_flow_project_keeps_one_recoverable_page(self):
+        log,count=run_tidy([FLOW_PROJECT,FLOW_PROJECT,ACCOUNT])
+        self.assertEqual(log,[('close',FLOW_PROJECT)])
+        self.assertEqual(count,1)
+
+    def test_a_different_flow_project_does_not_make_an_unfinished_editor_disposable(self):
+        log,_=run_tidy([FLOW_PROJECT,'https://flow.google.com/u/0/project/other/edit/unfinished',ACCOUNT])
+        self.assertEqual(log,[])
+
+    def test_a_dashboard_with_a_pending_studio_upload_is_protected(self):
+        with patch.object(browser_tabs,'pending_studio',return_value=True):
+            log,_=run_tidy([ACCOUNT,'https://studio.youtube.com/channel/UC1'])
+        self.assertEqual(log,[])
+
+    def test_a_connected_desktop_protects_the_visible_tab_but_not_hidden_disposable_dashboards(self):
+        visible='https://www.instagram.com/storywobble/'
+        spare='https://www.youtube.com/watch?v=old'
+        log,count=run_tidy([ACCOUNT,visible,spare],vnc_clients=1,visible_urls=[visible])
+        self.assertEqual(log,[('close',spare)])
+        self.assertEqual(count,1)
 
 
-if __name__ == '__main__':
-    unittest.main()
+
+class CompletedEditors(unittest.TestCase):
+    def test_only_a_verified_saved_result_releases_an_editor(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);media=root/'video.mp4';media.write_bytes(b'verified result')
+            url='https://flow.google.com/u/0/project/example'
+            receipt={'status':'completed','project_url':url,'video_file':str(media),
+                'sha256':hashlib.sha256(media.read_bytes()).hexdigest()}
+            path=root/'flow_example.json';path.write_text(json.dumps(receipt))
+            self.assertEqual(browser_tabs.completed_editor_urls(root),{url})
+            self.assertTrue(browser_tabs.disposable(url,completed_editors={url}))
+            self.assertFalse(browser_tabs.disposable(url))
+            media.write_bytes(b'changed')
+            self.assertEqual(browser_tabs.completed_editor_urls(root),set())
+
+    def test_a_proven_empty_editor_can_close_while_its_receipts_stay(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);folder=root/'post_images/key/pics0';folder.mkdir(parents=True)
+            url='https://docs.google.com/images/d/example/edit'
+            snapshot='heading "Drop or select an image to start editing"'
+            proof=folder/'pics_receipt.json'
+            proof.write_text(json.dumps({'status':'empty_document_after_submission',
+                'empty_observed_at':123,'document_url':url,
+                'empty_evidence_sha256':hashlib.sha256(snapshot.encode()).hexdigest()}))
+            (folder/'empty_recovery_ui.json').write_text(json.dumps({'url':url,'snapshot':snapshot}))
+            self.assertEqual(browser_tabs.completed_editor_urls(root),{url})
+            self.assertTrue(proof.exists())
+
+    def test_an_unfinished_request_protects_a_shared_project(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);media=root/'video.mp4';media.write_bytes(b'complete')
+            url='https://flow.google.com/u/0/project/example'
+            (root/'flow_done.json').write_text(json.dumps({'status':'completed','project_url':url,
+                'video_file':str(media),'sha256':hashlib.sha256(media.read_bytes()).hexdigest()}))
+            (root/'flow_pending.json').write_text(json.dumps({'status':'submitted','project_url':url}))
+            self.assertEqual(browser_tabs.completed_editor_urls(root),set())
+
+
+if __name__ == "__main__":unittest.main()

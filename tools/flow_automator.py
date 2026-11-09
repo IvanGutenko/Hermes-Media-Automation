@@ -146,6 +146,14 @@ async def wait_flow_entry(page,timeout=30):
     raise TimeoutError('Flow did not expose a project, region refusal or new-project control')
 
 
+async def require_generation_credits(page):
+    # This warning contains an <img> inside the prompt box. It is a provider
+    # refusal, not an attached ingredient. Only check before a NEW submission:
+    # an exhausted balance must never prevent collection of an existing clip.
+    if await page.get_by_role('button', name='Insufficient credits warning', exact=True).is_visible():
+        raise ProviderUnavailable('Flow reports insufficient generation credits', 'quota_exhausted')
+
+
 async def configure_video(page, native_audio=False, model_name='Veo 3.1 - Lite'):
     # Flow can restore this banner on reload, covering the prompt/settings bar.
     # Dismiss it through its own control before operating the generator.
@@ -157,6 +165,7 @@ async def configure_video(page, native_audio=False, model_name='Veo 3.1 - Lite')
     if await done.is_visible():
         await done.click()
         await page.get_by_role('textbox', name='What do you want to create?', exact=True).wait_for()
+    await require_generation_credits(page)
     await page.keyboard.press('Escape')
     settings_button = page.get_by_role('button', name='Settings', exact=True)
     silent = page.get_by_role('switch', name='Return silent videos toggle', exact=True)
@@ -287,6 +296,17 @@ async def wait_for_new_tile(page, baseline, timeout_seconds, baseline_errors=Non
     raise TimeoutError('No new video asset was produced by the submitted request')
 
 
+async def leave_editor(page):
+    """Tidy up after a verified clip. The page may hang after this click, and the next run closes the editor anyway, so
+    it must not turn a finished, verified result into an error (seen twice: a retry and 15 minutes lost each time)."""
+    try:
+        done = page.get_by_role('button', name='Done editing scene', exact=True)
+        if await done.is_visible():
+            await done.click(no_wait_after=True)
+    except Exception as exc:
+        print(f'Flow editor stayed open: {type(exc).__name__}', flush=True)
+
+
 async def generate_flow_video(prompt, title='Shorts Video', download_quality='720p', timeout_seconds=420, run_id=None, resume_download=False, voiceover_ru=None, model_name='Veo 3.1 - Lite', project_url=None):
     global PROJECT_URL
     if project_url:PROJECT_URL=project_url
@@ -344,7 +364,8 @@ async def generate_flow_video(prompt, title='Shorts Video', download_quality='72
                     await page.get_by_role('button',name=re.compile(r'New project|Новый проект')).click()
                     await page.wait_for_url(re.compile(r'/project/[a-f0-9-]+'),timeout=30000)
                 PROJECT_URL=page.url.split('?')[0]
-                result['project_url']=PROJECT_URL;save()
+                result['project_url']=PROJECT_URL
+                result['stage']='opening_editor';save()
                 decline=page.get_by_role('button',name='No thanks',exact=True)
                 if await decline.is_visible():await decline.click()
                 page.set_default_timeout(15000)
@@ -352,7 +373,20 @@ async def generate_flow_video(prompt, title='Shorts Video', download_quality='72
                 if await done.is_visible():
                     await done.click()
                     await page.get_by_role('textbox', name='What do you want to create?', exact=True).wait_for()
+                if not resume_download:
+                    await page.get_by_role('textbox', name='What do you want to create?', exact=True).wait_for(timeout=45000)
+                    await require_generation_credits(page)
+                result['stage']='loading_project_metadata';save()
                 await refresh_media_metadata(page)
+                result['metadata_ready_at']=time.time()
+                result['stage']='waiting_for_editor_after_reload';save()
+                # Metadata arrives before the editor finishes mounting on a large
+                # gallery. The earlier readiness wait was invalidated by reload.
+                editor_control=page.get_by_role('textbox',name='What do you want to create?',exact=True).or_(
+                    page.get_by_role('button',name='Done editing scene',exact=True))
+                await editor_control.first.wait_for(state='visible',timeout=60000)
+                result['editor_ready_after_reload_at']=time.time()
+                result['stage']='configuring_video';save()
                 if resume_download:
                     if request_is_lost(result.get('submitted_prompt'), result.get('submitted_at') or result.get('submission_attempted_at')):
                         raise ProviderUnavailable('Flow has no record of this request; it was lost', 'generation_failed')
@@ -374,10 +408,12 @@ async def generate_flow_video(prompt, title='Shorts Video', download_quality='72
                             submitted_at=result.get('submitted_at') or result.get('submission_attempted_at'))
                 else:
                     result['settings'] = await configure_video(page, native_audio=bool(voiceover_ru),model_name=model_name)
+                    result['stage']='observing_baseline';save()
                     if await page.locator('.loading-percentage').count():
                         raise RuntimeError('Flow already has a pending generation; cannot correlate a new result')
                     baseline = {key for key, _ in await video_tiles(page)}
                     result['baseline_media_ids'] = sorted(baseline)
+                    result['stage']='preparing_submission';save()
                     baseline_errors = await page.locator('.error-message-text').all_inner_texts()
                     box = page.get_by_role('textbox', name='What do you want to create?', exact=True)
                     submitted_prompt = prompt + (' Vertical 9:16. Follow the specified shot changes and editing cuts. Clean graphic surfaces. '
@@ -429,9 +465,7 @@ async def generate_flow_video(prompt, title='Shorts Video', download_quality='72
                               width=stream['width'], height=stream['height'])
                 result.pop('error', None)
                 print(f'NEW generated asset: {result["media_id"]} -> {target}', flush=True)
-                done = page.get_by_role('button', name='Done editing scene', exact=True)
-                if await done.is_visible():
-                    await done.click()
+                await leave_editor(page)
             except Exception as exc:
                 result.update(status='error', error=type(exc).__name__+': '+str(exc))
                 if isinstance(exc,ProviderUnavailable):

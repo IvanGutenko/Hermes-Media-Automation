@@ -102,6 +102,22 @@ class AudioVoiceTests(unittest.TestCase):
             with self.assertRaises(lvl_voice.VoiceError):lvl_voice.speak('Привет', 'hero', 'ru', proxy='')
         self.assertEqual(sleeps, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
 
+    def test_dmitry_no_audio_uses_a_native_russian_fallback_and_records_both_voices(self):
+        import array
+        NoAudioReceived=type('NoAudioReceived',(Exception,),{})
+        voices=[]
+        async def flaky(text,voice,*args):
+            voices.append(voice)
+            if voice=='ru-RU-DmitryNeural':raise NoAudioReceived()
+            return b'x', []
+        loud=array.array('h',[3000]*lvl_voice.RATE)
+        with patch.object(lvl_voice,'_stream',flaky),patch.object(lvl_voice,'decode_pcm',return_value=loud),patch.object(lvl_voice.time,'sleep'):
+            result=lvl_voice.speak('Привет','hero','ru',proxy='')
+        self.assertEqual(voices,['ru-RU-DmitryNeural']*2+['ru-RU-SvetlanaNeural'])
+        self.assertEqual(result['requested_voice'],'ru-RU-DmitryNeural')
+        self.assertEqual(result['voice'],'ru-RU-SvetlanaNeural')
+        self.assertEqual(result['fallback_reason'],'primary_voice_no_audio')
+
     def test_every_speaker_kind_has_a_voice_in_both_languages(self):
         for kind in lvl_voice.SPEAKERS:
             for lang in ('ru', 'en'):
@@ -323,7 +339,8 @@ class WorkerTests(unittest.TestCase):
         self.w, self.p = lvl_worker, lvl_pipeline
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
-        self.patches = [patch.object(lvl_pipeline, 'RUNS', root / 'runs'), patch.object(lvl_worker, 'STATE', root / 'state.json'), patch.object(lvl_worker, 'CONFIG', root / 'brands.json')]
+        self.patches = [patch.object(lvl_pipeline, 'RUNS', root / 'runs'), patch.object(lvl_worker, 'STATE', root / 'state.json'), patch.object(lvl_worker, 'CONFIG', root / 'brands.json'),
+            patch.object(lvl_worker,'upgrade_pending')]
         for p in self.patches:p.start()
         self.run = root / 'runs' / 'lvl-1'
         (self.run).mkdir(parents=True)
@@ -340,6 +357,56 @@ class WorkerTests(unittest.TestCase):
         noon = 1_800_000_000 - 1_800_000_000 % 86400 + 12 * 3600
         self.assertEqual(self.w.last_slot(15, noon), noon - 12 * 3600 + 15 * 3600 - 86400)
         self.assertEqual(self.w.last_slot(10, noon), noon - 2 * 3600)
+
+    def interval_config(self):
+        return {**self.cfg,'languages':['ru','en'],'publish_interval_seconds':7200}
+
+    def test_interval_posts_one_language_per_account_then_alternates_without_a_catchup_burst(self):
+        cfg=self.interval_config();self._second_episode();state={};calls=[]
+        def send(platform,lang,manifest,*args):
+            calls.append((platform,lang,manifest['run_id']))
+            return {'status':'published','url':'https://example.test/'+str(len(calls))}
+        with patch.object(self.w,'now',return_value=100000) as clock,patch.object(self.w,'publish_one',side_effect=send),patch.object(self.w,'_announce'):
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),2)
+            self.assertEqual(self.w.publish_due(cfg,{},lambda *_:None),0)  # reload persisted receipts, no process memory
+            clock.return_value=107199
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),0)
+            clock.return_value=107200
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),2)
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),0)
+            clock.return_value=130000  # a long outage permits just one new video per account
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),2)
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),0)
+        self.assertEqual([c[1] for c in calls],['ru','ru','en','en','ru','ru'])
+        self.assertEqual(json.loads((self.run/'manifest.json').read_text())['status'],'published')
+
+    def test_interval_retries_frozen_source_and_does_not_block_other_accounts(self):
+        cfg=self.interval_config();state={};calls=[]
+        def send(platform,lang,manifest,*args):
+            calls.append((platform,lang,manifest['run_id']))
+            if platform=='youtube' and len(calls)==2:raise RuntimeError('upload confirmation pending')
+            return {'status':'published','url':'u'}
+        with patch.object(self.w,'now',return_value=100000),patch.object(self.w,'publish_one',side_effect=send),patch.object(self.w,'_alert'),patch.object(self.w,'_announce'):
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),1)
+            state=json.loads(self.w.STATE.read_text())
+            self.assertEqual(self.w.publish_due(cfg,state,lambda *_:None),1)
+        self.assertEqual(calls,[('telegram','ru','lvl-1'),('youtube','ru','lvl-1'),('youtube','ru','lvl-1')])
+        self.assertEqual(state['interval_pending'],{})
+
+    def test_interval_counts_receipts_from_held_episodes_and_ignores_old_daily_served_state(self):
+        cfg=self.interval_config();held=self._second_episode()
+        (held/'manifest.json').write_text(json.dumps({**self.manifest,'status':'held_for_visual_revision','published':{'youtube:en':{'at':99999,'url':'old'}}}))
+        with patch.object(self.w,'now',return_value=100000),patch.object(self.w,'publish_one',return_value={'status':'published','url':'u'}) as send,patch.object(self.w,'_announce'):
+            self.assertEqual(self.w.publish_due(cfg,{'served':{'ru':200000,'en':200000}},lambda *_:None),1)
+        self.assertEqual(send.call_args.args[:2],('telegram','ru'))
+
+    def test_interval_generation_refills_an_empty_destination_even_if_another_one_has_a_backlog(self):
+        cfg={**self.interval_config(),'backlog_target':2}
+        for p in (self.run,self._second_episode()):
+            m=json.loads((p/'manifest.json').read_text())
+            m['published']={f'telegram:{lang}':{'at':1,'url':'u'} for lang in ('ru','en')}
+            (p/'manifest.json').write_text(json.dumps(m))
+        self.assertTrue(self.w.need_production(cfg,{}))
 
     def test_a_busy_host_postpones_production_without_counting_a_failure(self):
         (self.run.parent.parent / 'brands.json').write_text(json.dumps({'lvl': {**self.cfg, 'backlog_target': 3}}))
@@ -531,7 +598,7 @@ class PipelineTests(unittest.TestCase):
     """produce() wired end to end with the network and the text model replaced by fixtures; frames and mp4 files are real."""
 
     def setUp(self):
-        import array, math
+        import array, copy, math, subprocess
         import lvl_pipeline
         self.p = lvl_pipeline
         self.tmp = tempfile.TemporaryDirectory()
@@ -542,6 +609,21 @@ class PipelineTests(unittest.TestCase):
         self.episode = {'title_ru': 'Заголовок', 'title_en': 'Title', 'summary': 's', 'guest': None, 'claims': [{'id': 'c1', 'text_en': 'x', 'evidence': 'e1'}],
             'scenes': [{'speaker': 'lvl', 'text_ru': 'раз два', 'text_en': 'one two', 'setting': 'gym', 'claim': 'c1', 'actors': [{'id': 'lvl', 'side': 'center', 'expression': 'happy', 'action': 'cheer'}],
                 'props': [{'icon': 'dumbbell', 'x': 0.5, 'y': 0.25, 'at': 0.3}], 'popup': '+10 XP', 'level_up': False}]}
+        self.episode['scenes']=[copy.deepcopy(self.episode['scenes'][0]) for _ in range(3)]
+        raw=[]
+        for i,color in enumerate(('purple','orange')):
+            path=root/f'fixture-insert-{i}.mp4'
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i',f'color=c={color}:s=720x1280:r=24',
+                '-t','1.5','-c:v','libx264','-threads','1','-pix_fmt','yuv420p',str(path)],check=True)
+            raw.append(path)
+        def prepared_inserts(run,episode,prepared,log):
+            # Network boundary only. The real decoder, compositor, encoder and
+            # technical gates still operate on two distinct fixture MP4 files.
+            return {'system':'lvl-hybrid-v1','scenes':{str(i):{'raw_video':str(path)} for i,path in zip((1,3),raw)}}
+        def actual_review(video,episode,scenes,lang,target):
+            import hashlib
+            return {'video_sha256':hashlib.sha256(video.read_bytes()).hexdigest(),'publishable':True,'score_1_to_5':4,
+                'scenes':[{'id':i+1,'matches_narration':True,'meaningful_action_or_edit':True} for i in range(len(scenes))]}
         topic = {'phrase': 'how to build muscle', 'title_en': 'Build muscle', 'title_ru': 'Мышцы', 'evidence_query_en': 'muscle', 'broad_query_en': '', 'angle': 'a', 'rubric': 'body'}
         evidence = [{'id': 'e1', 'source': 'PubMed', 'title': 't', 'year': '2024', 'journal': 'J', 'kind': 'review', 'url': 'u', 'text': 'x' * 300, 'relevance': 1.0},
             {'id': 'e2', 'source': 'PubMed', 'title': 't2', 'year': '2023', 'journal': 'J', 'kind': 'review', 'url': 'u2', 'text': 'y' * 300, 'relevance': 0.9}]
@@ -549,6 +631,7 @@ class PipelineTests(unittest.TestCase):
             patch.object(lvl_cast, 'REGISTRY', root / 'characters.json'), patch.object(lvl_topics, 'DATA', root / 'lvl'),
             patch.object(lvl_pipeline.lvl_script, 'pick_topic', return_value=topic), patch.object(lvl_pipeline.lvl_topics, 'evidence', return_value=(evidence, {})),
             patch.object(lvl_pipeline.lvl_script, 'write_episode', return_value=self.episode), patch.object(lvl_pipeline.lvl_voice, 'speak', return_value=self.voice),
+            patch.object(lvl_pipeline.lvl_hybrid,'ensure',side_effect=prepared_inserts),patch.object(lvl_pipeline.lvl_hybrid,'inspect',side_effect=actual_review),
             patch.object(lvl_pipeline, 'host_headroom', return_value=(8000, 0.0))]
         for q in self.patches:q.start()
 
@@ -561,8 +644,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(manifest['status'], 'ready')
         run = self.p.RUNS / manifest['run_id']
         for lang in ('ru', 'en'):
-            self.assertTrue((run / lang / 'short.mp4').exists())
-            self.assertFalse((run / lang / 'mix.wav').exists())
+            self.assertTrue(Path(manifest['videos'][lang]).exists())
+            self.assertFalse((Path(manifest['videos'][lang]).parent/'mix.wav').exists())
             self.assertGreater(manifest['gates'][lang]['mean_volume_db'], -38)
         self.assertEqual(set(manifest['sha256']), {'ru', 'en'})
         self.assertTrue((run / 'script.json').exists())
@@ -618,7 +701,7 @@ class PipelineTests(unittest.TestCase):
         import hashlib
         manifest = self.p.produce(log=lambda *_: None)
         run = self.p.RUNS / manifest['run_id']
-        ru_before = hashlib.sha256((run / 'ru' / 'short.mp4').read_bytes()).hexdigest()
+        ru_before = hashlib.sha256(Path(manifest['videos']['ru']).read_bytes()).hexdigest()
         manifest['published'] = {'telegram:ru': {'url': 'https://t.me/x/3'}}
         self.p.save(run / 'manifest.json', manifest)
         script = json.loads((run / 'script.json').read_text())
@@ -629,9 +712,9 @@ class PipelineTests(unittest.TestCase):
         spoken = ' '.join(str(c) for c in speak.call_args_list)
         self.assertIn('three four', spoken)
         self.assertNotIn('раз два', spoken)
-        self.assertEqual(hashlib.sha256((run / 'ru' / 'short.mp4').read_bytes()).hexdigest(), ru_before)
+        self.assertEqual(hashlib.sha256(Path(again['videos']['ru']).read_bytes()).hexdigest(), ru_before)
         self.assertEqual((again['status'], again['published'], list(again['rerendered'])), ('ready', {'telegram:ru': {'url': 'https://t.me/x/3'}}, ['en']))
-        self.assertEqual(again['sha256']['en'], hashlib.sha256((run / 'en' / 'short.mp4').read_bytes()).hexdigest())
+        self.assertEqual(again['sha256']['en'], hashlib.sha256(Path(again['videos']['en']).read_bytes()).hexdigest())
         manifest['status'] = 'failed'
         self.p.save(run / 'manifest.json', manifest)
         with self.assertRaisesRegex(self.p.ProduceError, 'only ready episodes'):self.p.rerender(manifest['run_id'], ['en'])
@@ -701,6 +784,8 @@ class EncoderCommandTests(unittest.TestCase):
             class stderr:
                 @staticmethod
                 def read():return b''
+                @staticmethod
+                def close():pass
             def wait(self, timeout=None):return 0
             def kill(self):pass
 

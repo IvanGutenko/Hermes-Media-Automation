@@ -113,6 +113,11 @@ def script_features(run_dir, brand):
     """What this video actually did, read from its script: nothing here is inferred from its performance."""
     try:script = json.loads((Path(run_dir) / 'script.json').read_text())
     except (OSError, ValueError):return {}
+    if brand == 'lvl' and script.get('episode'):
+        episode = script['episode']
+        return {'topic': script.get('topic', {}).get('rubric', 'other'),
+            'scenes': len(episode.get('scenes', [])), 'experiments': {},
+            'growth_actions': episode.get('growth_actions', {})}
     scenes = script.get('scenes') or []
     spoken = [s.get('voiceover_ru', '') for s in scenes]
     total = sum(len(s.split()) for s in spoken)
@@ -121,7 +126,8 @@ def script_features(run_dir, brand):
     meta = script.get('youtube_meta') or {}
     return {'hook': spoken[0] if spoken else None, 'scenes': len(scenes), 'spoken_words': total, 'closing_share': round(closing / total, 2) if total else None,
         'closing': script.get('closing') or 'fixed', 'topic': topic_class(brand, meta.get('title', '') + ' ' + (spoken[0] if spoken else '')),
-        'experiments': script.get('experiments') or {}, 'voice': script.get('narration_voice')}
+        'experiments': script.get('experiments') or {}, 'voice': script.get('narration_voice'),
+        'growth_actions': script.get('growth_actions', {})}
 
 
 def rows_for(brand, latest, store, now):
@@ -133,6 +139,7 @@ def rows_for(brand, latest, store, now):
         api = store.get('videos', {}).get(vid, {})
         published = item.get('published_at')
         row = {'title': (item.get('title') or '')[:90], 'url': item.get('url'), 'run_id': item.get('run_id'), 'duration': item.get('duration'),
+            'lang': item.get('lang'),
             'age_hours': round((now - published) / 3600, 1) if published else None,
             'hour_msk': datetime.fromtimestamp(published, MSK).hour if published else None,
             'views': public.get('views') if public.get('views') is not None else api.get('views'),
@@ -293,6 +300,9 @@ def thompson_pick(brand, candidates, rows, rng=None, now=None):
 def pick_source(brand, candidates):
     """Pipeline hook: never lets analytics stop production."""
     try:
+        from growth_actions import choose
+        measured = choose(brand, candidates)
+        if measured is not None:return measured
         latest = _load(BASE_DIR / 'output/content_analytics/latest.json', {})
         return thompson_pick(brand, candidates, rows_for(brand, latest, _load(STORE, {}), time.time())) or candidates[0]
     except Exception:return candidates[0]
@@ -420,6 +430,11 @@ def run(now=None, latest=None, configs=None, notify=None):
         report['brands'][brand] = info
     report['experiments'] = close_experiments(rows_by_brand, notify=notify or _notify)
     _save(REPORT, report)
+    # The factory consumes these actions even when the daily Hermes report is unavailable.
+    from growth_actions import refresh
+    refresh(now=now,notify=True)
+    from growth_strategy import refresh as refresh_strategy
+    refresh_strategy(now=now)
     return report
 
 

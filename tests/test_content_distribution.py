@@ -7,7 +7,38 @@ import script_generator
 
 
 class PendingPublicationTests(unittest.TestCase):
-    def test_native_reddit_success_survives_a_lost_worker_response_and_preserves_profile_cadence(self):
+    def test_community_cadence_ignores_profile_and_other_community_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);out=root/'output';out.mkdir()
+            for i,(target,stamp) in enumerate((('u_ThinkScope',300),('r_Migratoriya',200),('r_WrongDev',100))):
+                (out/('native_reddit_'+str(i)*64+'.json')).write_text(json.dumps({
+                    'status':'published','username':'ThinkScope','target':target,'source_id':target,
+                    'public_verified_at':stamp,'url':'https://www.reddit.com/comments/'+str(i)+'/'}))
+            cursor=root/'cursor.json'
+            with patch.object(distribution,'BASE_DIR',root):distribution.sync_reddit_cursor(cursor,'r_WrongDev')
+            self.assertEqual(json.loads(cursor.read_text())['last_post_at'],100)
+            self.assertEqual(json.loads(cursor.read_text())['source_id'],'r_WrongDev')
+
+    def test_retired_native_adapter_preserves_existing_receipts_without_starting_a_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);out=root/'output';out.mkdir()
+            cfg={'target':'r_WrongDev','username':'ThinkScope'}
+            payload={'source_id':'post-1','title':'Title','text':'Body'}
+            state={'key':'d'*64,'source_id':'post-1'}
+            proof={'status':'published','username':'ThinkScope','target':'r_Migratoriya',
+                   'source_id':'post-1','sha256':None,'public_verified_at':200,'id':'wrong',
+                   'url':'https://www.reddit.com/r/Migratoriya/comments/wrong/'}
+            (out/('native_reddit_'+state['key']+'.json')).write_text(json.dumps(proof))
+            response=Mock(returncode=0,stdout=json.dumps({'status':'published','url':proof['url']}))
+            with patch.object(distribution,'BASE_DIR',root),patch.object(distribution,'run_publisher',return_value=response) as worker:
+                result=distribution.reddit(cfg,payload,state,lambda:None)
+            self.assertEqual(result['status'],'disabled')
+            worker.assert_not_called()
+            self.assertFalse((out/('reddit_native_job_'+state['key']+'.json')).exists())
+            self.assertEqual(json.loads((out/('native_reddit_'+state['key']+'.json')).read_text()),proof)
+            self.assertNotEqual(state.get('status'),'published')
+
+    def test_stale_enabled_config_cannot_retry_reddit_or_create_a_new_publication(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);out=root/'output';out.mkdir();data=root/'data';data.mkdir()
             config=data/'brands.json';config.write_text(json.dumps({'migratoria':{'publishing':{'reddit':{'enabled':True,'target':'u_ThinkScope'}}}}))
@@ -19,12 +50,37 @@ class PendingPublicationTests(unittest.TestCase):
                 'publication_attempted_at':100,'public_verified_at':200}
             (out/('native_reddit_'+key+'.json')).write_text(json.dumps(proof))
             result=Mock(returncode=0,stdout=json.dumps({'status':'published','url':proof['url']}))
-            with patch.object(distribution,'BASE_DIR',root),patch.object(distribution,'DATA',data),patch.object(distribution,'CONFIG',config),patch.object(distribution,'run_browser',return_value=result),patch.object(distribution.time,'time',return_value=300):
+            with patch.object(distribution,'BASE_DIR',root),patch.object(distribution,'DATA',data),patch.object(distribution,'CONFIG',config),patch.object(distribution,'run_browser',return_value=result) as worker,patch.object(distribution.time,'time',return_value=300):
                 published=distribution.publish('migratoria','reddit',payload)
                 scheduled=distribution.publish('migratoria','reddit',{**payload,'source_id':'migration-post-14'})
-            self.assertEqual(published['public_verified_at'],200)
-            self.assertEqual(scheduled['status'],'scheduled')
-            self.assertEqual(json.loads((data/'distribution/reddit_ThinkScope_cursor.json').read_text())['last_post_at'],100)
+            self.assertEqual(published['status'],'disabled')
+            self.assertEqual(scheduled['status'],'disabled')
+            worker.assert_not_called()
+            self.assertFalse((data/'distribution').exists())
+            self.assertEqual(json.loads((out/('native_reddit_'+key+'.json')).read_text()),proof)
+
+    def test_legacy_reconciliation_neither_reads_the_browser_nor_reenables_reddit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data=Path(tmp);config=data/'media_brands.json'
+            before=json.dumps({'wrongdev':{'publishing':{'reddit':{'enabled':False,'post_enabled':False,'video_enabled':False}}}})
+            config.write_text(before)
+            (data/'reddit_pending_jobs.json').write_text('["old-job.json"]')
+            with patch.object(distribution,'DATA',data),patch.object(distribution,'CONFIG',config),patch.object(distribution,'run_publisher') as worker:
+                self.assertEqual(distribution.reconcile_reddit()['status'],'disabled')
+            worker.assert_not_called()
+            self.assertEqual(config.read_text(),before)
+
+    def test_posts_skip_reddit_even_with_old_enabled_flags_and_a_pending_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data=Path(tmp);receipts=data/'distribution';receipts.mkdir()
+            config=data/'media_brands.json'
+            config.write_text(json.dumps({'wrongdev':{'publishing':{'reddit':{'enabled':True,'post_enabled':True}}}}))
+            receipt=receipts/('wrongdev_reddit_'+'a'*64+'.json')
+            receipt.write_text(json.dumps({'status':'publishing','source_id':'post-1'}))
+            with patch.object(distribution,'DATA',data),patch.object(distribution,'CONFIG',config),patch.object(distribution,'publish') as worker:
+                distribution.distribute_posts()
+            worker.assert_not_called()
+            self.assertEqual(json.loads(receipt.read_text())['status'],'publishing')
 
     def test_vk_native_send_state_survives_publisher_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:

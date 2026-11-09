@@ -123,7 +123,12 @@ class Closing(unittest.TestCase):
         import json
         experiments=[{'id':'wd-q','brand':'wrongdev','params':{'question':True}},{'id':'wd-hook','brand':'wrongdev'}]
         fields={'question':True,'experiments':{'wd-q':'test','wd-hook':'control'}}
-        raw=json.dumps(self.script())
+        data=self.script()
+        data.update(visual_mode='hybrid',motion_system='editorial-v2',motion_palette='cobalt')
+        for scene,kind,layout in zip(data['scenes'],['hybrid','motion','motion'],['spotlight','workflow','kinetic']):
+            scene.update(visual_type=kind,motion={'layout':layout,'headline':'Суть изменения',
+                'items':['Первый','Второй'],'kicker':''})
+        raw=json.dumps(data)
         with patch.dict(os.environ,MEDIA_BRAND='wrongdev'),patch.object(gb,'active',return_value=experiments):
             with self.assertRaises(sg.ArmRuleError):sg._validated(raw,fields,'wrongdev',last_try=False)
             data=sg._validated(raw,fields,'wrongdev',last_try=True)

@@ -26,6 +26,7 @@ FAILED=re.compile(r"(couldn.t (be )?post|failed to (post|upload)|Не удало
 # TikTok's web site has no account switcher and one browser profile holds one session, so every other own
 # account keeps its session here (next to the profile's own cookies) and works in an isolated browser context.
 SESSIONS=Path('/data/profile/factory_sessions')
+STUDIO_POLLS=8
 
 
 class NeedsLogin(RuntimeError):
@@ -82,6 +83,19 @@ async def grid_ids(page,handle):
     await page.wait_for_timeout(6000)
     hrefs=await page.locator('a[href*="/video/"]').evaluate_all('(es)=>es.map(e=>e.getAttribute("href"))')
     return tt.video_ids(hrefs,handle)
+
+
+async def studio_ids(page,handle):
+    """The account's videos from its signed-in TikTok Studio list. A new account's public grid can answer
+    "Something went wrong" while the videos exist, and an isolated context needs up to half a minute to draw this page."""
+    await page.bring_to_front()
+    await page.goto(SITE+'/tiktokstudio/content',wait_until='domcontentloaded',timeout=60000)
+    for _ in range(STUDIO_POLLS):
+        await page.wait_for_timeout(5000)
+        hrefs=await page.locator('a[href*="/video/"]').evaluate_all('(es)=>es.map(e=>e.getAttribute("href"))')
+        ids=tt.video_ids(hrefs,handle)
+        if ids:return ids
+    return []
 
 
 async def dismiss_notices(page):
@@ -174,9 +188,12 @@ async def verify_id(context,state,video_id):
     saved id, the complete caption and public visibility."""
     page=await context.new_page()
     try:
+        await page.bring_to_front()
         await page.goto(SITE+'/tiktokstudio/content',wait_until='domcontentloaded',timeout=60000)
-        await page.wait_for_timeout(8000)
-        row=await page.evaluate(ROW_TEXT,video_id)
+        for _ in range(STUDIO_POLLS):
+            await page.wait_for_timeout(5000)
+            row=await page.evaluate(ROW_TEXT,video_id)
+            if row:break
         if row and fmt.caption_visible(row,state['caption']) and PUBLIC.search(row):
             return tt.video_url(state['username'],video_id)
         return None
@@ -189,7 +206,8 @@ async def verify_id(context,state,video_id):
 async def locate_and_verify(context,page,state,path):
     deadline=time.monotonic()+240
     while True:
-        found=tt.new_ids(state.get('codes_before',[]),await grid_ids(page,state['username']))
+        before=state.get('codes_before',[])
+        found=tt.new_ids(before,await grid_ids(page,state['username'])) or tt.new_ids(before,await studio_ids(page,state['username']))
         for video_id in found[:3]:
             url=await verify_id(context,state,video_id)
             if url:
@@ -253,7 +271,7 @@ async def publish(job_path,read_only=False,dry_run=False):
                         if len(failed)>2:raise RuntimeError('TikTok failed to post three times; the owner must look') from None
                 if not state.get('url') and fmt.may_resubmit(state):
                     if read_only:raise RuntimeError('Read-only reconciliation cannot create a post')
-                    state['codes_before']=await grid_ids(page,handle);save(path,state)
+                    state['codes_before']=sorted(set(await grid_ids(page,handle))|set(await studio_ids(page,handle)));save(path,state)
                     await compose(page,state,path,raw,dry_run)
                     if dry_run:
                         state['status']='dry_run_ok';return state

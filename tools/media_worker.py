@@ -9,6 +9,21 @@ from pathlib import Path
 from datetime import datetime
 
 
+def publication_interval(config):
+    return max(1, int(config.get('publish_interval_seconds', 10800)))
+
+
+def publication_due(slot, config):
+    if slot.get('last_published_at'):
+        return slot['last_published_at'] + publication_interval(config)
+    return slot['next_due']
+
+
+def prepare_lead(config):
+    """Prepare within one publication interval; the publication deadline itself stays unchanged."""
+    return max(0,min(publication_interval(config),int(config.get('prepare_lead_seconds',1800))))
+
+
 def nothing_due(base,now=None):
     """Standard library only: the minute timer usually finds nothing to do, and the imports below cost about 1 s of CPU
     plus page faults on a slow disk, 1440 times a day. Any doubt means the full tick runs."""
@@ -21,7 +36,7 @@ def nothing_due(base,now=None):
             if not cfg.get('video_enabled') or cfg.get('quality_hold'):continue
             slot=state.get(brand)
             if slot is None:return False
-            if slot.get('job') or now>=slot['next_due']-1800:
+            if slot.get('job') or now>=publication_due(slot,cfg)-prepare_lead(cfg):
                 if now>=slot.get('retry_after',0) or slot.get('error')=='No fresh verified Migratoria post is ready for video':return False
         return True
     except (OSError,ValueError,KeyError,AttributeError):return False
@@ -29,8 +44,20 @@ def nothing_due(base,now=None):
 
 def publisher_is_waiting(base,now=None):
     """A publisher wants the shared browser: no new scene starts this minute (see browser_process.wait_for_lease)."""
-    try:return (now or time.time())-(base/'output/.publisher-waiting').stat().st_mtime<120
+    now=now or time.time()
+    try:
+        if now-(base/'output/.publisher-waiting').stat().st_mtime>=120:return False
+        configs=json.loads((base/'data/media_brands.json').read_text())
+        schedule=json.loads((base/'data/media_schedule.json').read_text())
+        # Recurring browser/image tasks must not keep an overdue video out of
+        # the lock queue forever. Active browser work still owns the same lease.
+        for brand,cfg in configs.items():
+            slot=schedule.get(brand,{})
+            if cfg.get('video_enabled') and not cfg.get('quality_hold') and slot and now>=publication_due(slot,cfg)+1800:
+                return False
+        return True
     except OSError:return False
+    except (ValueError,KeyError,TypeError):return True
 
 
 if __name__=='__main__':
@@ -102,12 +129,13 @@ def tick():
                 migration['auth_error']=type(exc).__name__+': '+str(exc)[:250]
                 save(CONFIG,configs)
         # Serve the oldest due slot first when both channels need the one browser.
-        for brand,cfg in sorted(configs.items(),key=lambda item:state.get(item[0],{}).get('next_due',item[1].get('anchor_epoch',0)+10800)):
+        for brand,cfg in sorted(configs.items(),key=lambda item:publication_due(state.get(item[0],{'next_due':item[1].get('anchor_epoch',0)+publication_interval(item[1])}),item[1])):
             if not cfg.get('video_enabled'): continue
             if cfg.get('quality_hold'): continue
-            slot=state.setdefault(brand,{'next_due':cfg['anchor_epoch']+10800})
+            slot=state.setdefault(brand,{'next_due':cfg['anchor_epoch']+publication_interval(cfg)})
+            slot['next_due']=publication_due(slot,cfg)
             now=time.time()
-            if now < slot['next_due']-1800 and not slot.get('job'):continue
+            if now < slot['next_due']-prepare_lead(cfg) and not slot.get('job'):continue
             quota_path=DATA/'tts_quota.json'
             if cfg.get('audio_mode','gemini')=='gemini' and quota_path.exists():
                 quota=json.loads(quota_path.read_text())
@@ -183,10 +211,10 @@ def tick():
                             category_id=cfg.get('category_id','28'))
                     manifest.update(status='published',youtube_url=uploaded['url'],publication=uploaded,brand=brand)
                 save(manifest_file,manifest)
-                # Three hours from the real confirmed publication. A delayed job
+                # Space from the real confirmed publication. A delayed job
                 # must not leave the following slot only a few minutes away.
                 published_at=time.time()
-                slot.update(next_due=published_at+10800,last_published_at=published_at,last_publication=uploaded)
+                slot.update(next_due=published_at+publication_interval(cfg),last_published_at=published_at,last_publication=uploaded)
                 if brand=='migratoria':
                     from migratoria_editor import db
                     with db() as con:con.execute('UPDATE posts SET video_run=? WHERE id=?',(run_id,manifest['source_post_id']))
@@ -198,12 +226,13 @@ def tick():
                 slot['attempts']+=1
                 message=str(exc)
                 slot.update(error=type(exc).__name__+': '+(message if len(message)<=1400 else message[:200]+' […] '+message[-1100:]),retry_after=time.time()+900)
-                from video_provider_pool import BeforeSubmissionFailure
+                from video_provider_pool import BeforeSubmissionFailure,IncludedProvidersUnavailable
                 if isinstance(exc,BeforeSubmissionFailure):slot['retry_after']=time.time()+60
+                if isinstance(exc,IncludedProvidersUnavailable):slot['retry_after']=max(time.time()+60,exc.retry_after)
                 from bundled_voiceover import NarrationNeedsReview
                 from script_review import ScriptNeedsReview
-                from video_quality import VisualReviewNeedsReview
-                if isinstance(exc,(NarrationNeedsReview,ScriptNeedsReview,VisualReviewNeedsReview)):
+                from video_quality import VisualReviewNeedsReview,HybridStyleRequired
+                if isinstance(exc,(NarrationNeedsReview,ScriptNeedsReview,VisualReviewNeedsReview,HybridStyleRequired)):
                     # Hold the failed source, not the whole channel forever.
                     # No publication occurred and the due slot remains unchanged.
                     path=DATA/'review_held_video_sources.json'
@@ -212,10 +241,10 @@ def tick():
                         'run_id':run_id,'reason':slot['error'],'held_at':time.time()}
                     save(path,holds)
                     if manifest_file.exists():
-                        held=json.loads(manifest_file.read_text());held.update(status='held_for_review',error=slot['error']);save(manifest_file,held)
+                        held=json.loads(manifest_file.read_text());held.update(status='held_for_style_upgrade' if isinstance(exc,HybridStyleRequired) else 'held_for_review',error=slot['error']);save(manifest_file,held)
                     if brand=='migratoria':
                         from migratoria_editor import db
-                        kind='visual_review_rejected:' if isinstance(exc,VisualReviewNeedsReview) else 'narration_requires_review:'
+                        kind='hybrid_upgrade_required:' if isinstance(exc,HybridStyleRequired) else 'visual_review_rejected:' if isinstance(exc,VisualReviewNeedsReview) else 'narration_requires_review:'
                         with db() as con:con.execute('UPDATE posts SET video_exclusion_reason=? WHERE id=?',(kind+run_id,slot['source_post_id']))
                     notify('held',brand,run_id,slot['error'])
                     slot.update(last_held_job=slot.pop('job'),retry_after=time.time()+60)

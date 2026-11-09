@@ -122,6 +122,7 @@ def review(parts, diagnostic, timeout=90):
     # The media route is isolated from the interactive Hermes route and already
     # carries the browser's Google requests. Neither route changes VPN selection.
     routes=('http://127.0.0.1:17893','http://127.0.0.1:17890')
+    api_region_unavailable=False
     for model in API_MODELS:
         for proxy in routes:
             try:
@@ -146,14 +147,24 @@ def review(parts, diagnostic, timeout=90):
                 return result,model
             # Model quota/overload affects both routes; don't retry it on another
             # IP. Only a transport failure justifies trying the independent route.
+            error={}
             try:
                 error=r.json().get('error',{})
                 if isinstance(error,dict):attempts[-1]['provider_status']=error.get('status')
             except (ValueError,TypeError):pass
+            if (r.status_code==400 and isinstance(error,dict) and error.get('status')=='FAILED_PRECONDITION'
+                    and 'location is not supported' in error.get('message','').lower()):
+                # This API product is unavailable here. Do not try another IP or
+                # model for the same refusal; use the already approved alternative
+                # provider below, which still has to produce a real media review.
+                attempts[-1]['error']='api_region_unavailable'
+                api_region_unavailable=True
+                break
             if r.status_code in (400,401,403):
                 diagnostic.write_text(json.dumps({'attempts':attempts},indent=2))
                 raise RuntimeError('Media review rejected request: HTTP '+str(r.status_code))
             break
+        if api_region_unavailable:break
     # Subscription route before the free tier: the API key has its own quota and the CLI does not.
     alternative=agy_media_review(parts,attempts) or free_visual_review(parts,attempts,timeout)
     if alternative:

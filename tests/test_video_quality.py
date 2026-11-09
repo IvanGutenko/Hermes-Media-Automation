@@ -1,7 +1,7 @@
 import sys,unittest
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
-from video_quality import VisualReviewNeedsReview,require_pass
+from video_quality import VisualReviewNeedsReview,HybridStyleRequired,require_pass,require_artifact,uses_news_hybrid
 
 
 def verdict(**kw):
@@ -11,6 +11,12 @@ def verdict(**kw):
 
 
 class VisualVerdictTests(unittest.TestCase):
+    def test_old_or_nominal_only_hybrid_news_cannot_start_any_future_upload(self):
+        for manifest in ({},{'visual_mode':'hybrid','motion_system':'editorial-v2','scenes':[{'visual_type':'video'}]},
+                         {'visual_mode':'hybrid','motion_system':'html-gsap-v1','scenes':[{'visual_type':'motion'},{'visual_type':'hybrid'}]}):
+            self.assertFalse(uses_news_hybrid(manifest))
+            with self.assertRaises(HybridStyleRequired):require_artifact({**manifest,'script_review':{'supported':True,'allowed_topic':True}})
+
     def test_a_score_only_rejection_names_its_reason_instead_of_an_empty_string(self):
         with self.assertRaisesRegex(VisualReviewNeedsReview,'score 2/5 is below the 3/5 publication bar'):
             require_pass(verdict(score_1_to_5=2),1)

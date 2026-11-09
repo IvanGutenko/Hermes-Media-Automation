@@ -35,7 +35,7 @@ def main():
     upload.add_argument('privacy', nargs='?', default='public')
     args = parser.parse_args()
     if args.action == 'status':
-        result = subprocess.run(['docker', 'ps', '--filter', 'name=video_factory_auth', '--format', '{{.Names}} {{.Status}}'])
+        result = subprocess.run([PYTHON_BIN,str(SCRIPTS_DIR/'factory_status.py')])
         return result.returncode
     if args.action == 'script':
         cmd = [PYTHON_BIN, str(SCRIPTS_DIR / 'script_generator.py')]

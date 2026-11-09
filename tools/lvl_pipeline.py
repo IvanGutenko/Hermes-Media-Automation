@@ -15,6 +15,7 @@ import lvl_render
 import lvl_script
 import lvl_topics
 import lvl_voice
+import lvl_hybrid
 
 BASE_DIR = Path(os.getenv('VIDEO_FACTORY_DIR', Path(__file__).resolve().parent.parent))
 RUNS = BASE_DIR / 'output' / 'lvl_runs'
@@ -108,12 +109,29 @@ def collect_evidence(topic):
     return items, errors
 
 
-def render_scenes(episode, cast, lang):
+def render_scenes(episode, cast, lang, cache=None):
     """Voice every line and assemble render scenes for one language."""
     scenes = []
     for i, sc in enumerate(episode['scenes']):
         speaker = cast[sc['speaker']]
-        voice = lvl_voice.speak(sc['text_' + lang], speaker['voice'], lang)
+        identity=hashlib.sha256(json.dumps([sc['text_'+lang],speaker['voice'],lang,lvl_voice.voice_for(speaker['voice'],lang)],ensure_ascii=False).encode()).hexdigest()
+        wav=Path(cache)/(f'{i+1:02d}_{identity[:12]}.wav') if cache else None
+        receipt=wav.with_suffix('.json') if wav else None
+        if wav and wav.exists() and receipt.exists():
+            import wave
+            from array import array
+            proof=json.loads(receipt.read_text())
+            if proof.get('identity')!=identity or hashlib.sha256(wav.read_bytes()).hexdigest()!=proof['sha256']:raise ProduceError('LVL saved voice differs from its scene receipt')
+            with wave.open(str(wav),'rb') as stream:
+                if stream.getframerate()!=lvl_voice.RATE or stream.getnchannels()!=1 or stream.getsampwidth()!=2:raise ProduceError('Invalid saved LVL voice format')
+                samples=array('h');samples.frombytes(stream.readframes(stream.getnframes()))
+            voice={'samples':samples,'words':proof['words'],'duration':len(samples)/lvl_voice.RATE}
+        else:
+            voice = lvl_voice.speak(sc['text_' + lang], speaker['voice'], lang)
+            if wav:
+                wav.parent.mkdir(parents=True,exist_ok=True);lvl_voice.write_wav(wav,voice['samples'])
+                save(receipt,{'identity':identity,'sha256':hashlib.sha256(wav.read_bytes()).hexdigest(),'words':voice['words'],'voice':voice['voice'],
+                    'requested_voice':voice.get('requested_voice',voice['voice']),'fallback_reason':voice.get('fallback_reason')})
         scenes.append({'setting': sc['setting'], 'seed': i, 'samples': voice['samples'], 'words': voice['words'], 'duration': voice['duration'],
             'envelope': lvl_voice.envelope(voice['samples']),
             'actors': [{'spec': cast[a['id']]['spec'], 'side': a['side'], 'expression': a['expression'], 'action': a['action'],
@@ -140,8 +158,9 @@ def find_resumable(now=None):
         except (OSError, ValueError):continue
         # 'rendering' while we hold the production lock means the process that was rendering it died (killed, host restarted): same as a failure
         stamp = m.get('failed_at') if m.get('status') == 'failed' else m.get('resumed_at') or m.get('started_at')
-        interrupted = m.get('status') == 'rendering' or (m.get('status') == 'failed' and m.get('resumable'))
-        if interrupted and m.get('attempts', 1) < MAX_RENDER_ATTEMPTS and now - (stamp or 0) < RESUME_WINDOW and (p.parent / 'script.json').exists():
+        waiting=m.get('status')=='waiting_media'
+        interrupted = waiting or m.get('status') == 'rendering' or (m.get('status') == 'failed' and m.get('resumable'))
+        if interrupted and (waiting or (m.get('attempts', 1) < MAX_RENDER_ATTEMPTS and now - (stamp or 0) < RESUME_WINDOW)) and (p.parent / 'script.json').exists():
             return p.parent, m
     return None
 
@@ -174,21 +193,61 @@ def render_languages(run, manifest, episode, cast, langs, log=print):
     number = manifest['episode']
     level = 1 + (number - 1) // 4
     music = MUSIC[number % len(MUSIC)]
+    # Both timings constrain the SAME fresh inserts, even when one language is
+    # being upgraded. Clips belong to this episode, not a stock-footage cache.
+    prepared={}
+    for lang in LANGS:
+        log('LVL voice preparation: '+lang)
+        prepared[lang]=render_scenes(episode,cast,lang,run/lang/'hybrid-v1/voice_lines')
+    manifest['hybrid']=lvl_hybrid.ensure(run,episode,prepared,log)
+    manifest.update(visual_mode='hybrid',motion_system=lvl_hybrid.SYSTEM,scene_count=len(episode['scenes']))
+    save(run/'manifest.json',manifest)
     for lang in langs:
-        scenes = render_scenes(episode, cast, lang)
-        out = run / lang / 'short.mp4'
-        result = lvl_render.render(scenes, out, run / lang, episode['title_' + lang], SUBTITLE[lang], END_LINES[lang], cast[lvl_cast.HERO]['spec'],
-            level=level, xp_start=0.2 + 0.2 * ((number - 1) % 4), name='LVL', music=music)
+        log('LVL hybrid render: '+lang)
+        scenes = prepared[lang]
+        for scene_id,asset in manifest['hybrid']['scenes'].items():scenes[int(scene_id)-1]['raw_video']=asset['raw_video']
+        # Existing public assets/receipts stay immutable during a queued upgrade.
+        out = run / lang / 'hybrid-v1' / 'short.mp4'
+        from browser_process import render_lease
+        # On this 5 GB/HDD host, encoding alongside an interactive page repeatedly
+        # drove memory pressure above 50% and disk pressure above 80% on 2026-11-03.
+        with render_lease(BASE_DIR):
+            result = lvl_render.render(scenes, out, out.parent, episode['title_' + lang], SUBTITLE[lang], END_LINES[lang], cast[lvl_cast.HERO]['spec'],
+                level=level, xp_start=0.2 + 0.2 * ((number - 1) % 4), name='LVL', music=music)
         manifest['videos'][lang] = str(out)
         manifest['gates'][lang] = gate(out, result['duration'])
         manifest['gates'][lang]['render_seconds'] = result['seconds']
+        manifest.setdefault('visual_reviews',{})[lang]=lvl_hybrid.inspect(out,episode,scenes,lang,out.parent/'visual_review.json')
+        manifest.setdefault('sha256',{})[lang]=hashlib.sha256(out.read_bytes()).hexdigest()
+        manifest.setdefault('timelines',{})[lang]=[{'id':i+1,'duration':sc['duration'],'raw_video':sc.get('raw_video')} for i,sc in enumerate(scenes)]
+        save(run/'manifest.json',manifest)
         log(f'{lang}: {manifest["gates"][lang]}')
-        (run / lang / 'mix.wav').unlink(missing_ok=True)
+        (out.parent/'mix.wav').unlink(missing_ok=True)
+
+
+def upgrade(run_id,langs,log=print):
+    """Upgrade queued cuts in place, retaining originals and every public receipt."""
+    run=RUNS/run_id;path=run/'manifest.json';manifest=json.loads(path.read_text())
+    if manifest.get('status')!='ready':raise ProduceError('Only a ready LVL episode can be upgraded')
+    saved=json.loads((run/'script.json').read_text())
+    LOCK.parent.mkdir(parents=True,exist_ok=True)
+    with LOCK.open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        check_host()
+        cast={**lvl_cast.load(),**(saved.get('cast_extra') or {})}
+        manifest.setdefault('original_videos',dict(manifest['videos']))
+        save(path,manifest)
+        render_languages(run,manifest,saved['episode'],cast,langs,log)
+        for lang in langs:lvl_hybrid.require_artifact(manifest,lang)
+        manifest['hybrid_upgraded_at']=time.time();save(path,manifest)
+    return manifest
 
 
 def rerender(run_id, langs, log=print):
-    """Render chosen languages of a READY episode again from its (edited) script.json, e.g. after a wording rule changed.
-    Languages already published keep their receipts; only the video files of `langs` are replaced."""
+    """Render chosen languages of a READY episode again from its validated script.
+    Hybrid requests retain script identity; changed dialogue needs a new bound
+    production, rather than silently reusing footage accepted for another script.
+    Existing public receipts are preserved."""
     run = RUNS / run_id
     manifest = json.loads((run / 'manifest.json').read_text())
     if manifest.get('status') != 'ready':raise ProduceError(f'{run_id} is {manifest.get("status")}, only ready episodes are re-rendered')
@@ -237,8 +296,14 @@ def produce(rubric=None, log=print, force=False):
         number = manifest['episode']
         run_id = manifest['run_id']
         save(run / 'manifest.json', manifest)
+        from growth_strategy import record as record_strategy
+        record_strategy('lvl',run_id,episode.get('growth_actions') or {})
         try:
             render_languages(run, manifest, episode, cast, LANGS, log)
+        except lvl_hybrid.MediaPending as exc:
+            manifest.update(status='waiting_media',error=str(exc)[-400:],retry_after=exc.retry_after)
+            save(run/'manifest.json',manifest)
+            raise
         except BaseException as exc:
             # Voices, ffmpeg and the speech service fail for reasons unrelated to the script, so the finished script is kept and tried again later.
             manifest.update(status='failed', error=f'{type(exc).__name__}: {exc}'[:300], failed_at=time.time(), resumable=not isinstance(exc, (KeyboardInterrupt, SystemExit)))

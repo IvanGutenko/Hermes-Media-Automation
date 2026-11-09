@@ -1,0 +1,17 @@
+{
+  "gsap": "3.15.1",
+  "source": "https://registry.npmjs.org/gsap/-/gsap-3.15.1.tgz",
+  "files": {
+    "gsap.min.js": "3d1bea374ab1b703cc5c4105358eec63c4465efdc573931dc116e34a0a190c1b",
+    "MotionSans.ttf": "baccc64becc3eb7d104b7c84d99f5314a0a1f896e2b3ea6c2f22fc08d2003bee",
+    "FONT-LICENSE.txt": "93fed46019c38bbe566b479d22148e2e8a1e85ada614accb0211c37b2c61c19b",
+    "GSAP-LICENSE.html": "e30078f05dae228dd92d504e78f8bc12243ac1c3cde39bcce925e24fb85e6322",
+    "MotionDisplay.ttf": "3ae11c49db0455a3cc33e37d380f20fdb8c7f8b41dc07625c177e3d87a9d6ae6",
+    "Manrope-OFL.txt": "58172e0c0fac2cda8a37b348164bb55e44b0e69051e557e92b1d3f6910141f7b"
+  },
+  "display_font": {
+    "family": "Manrope",
+    "source": "https://github.com/google/fonts/tree/main/ofl/manrope",
+    "license": "SIL Open Font License 1.1"
+  }
+}

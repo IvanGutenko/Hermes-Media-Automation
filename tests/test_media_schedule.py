@@ -26,9 +26,10 @@ class ScheduleTests(unittest.TestCase):
         video=folder/'short.mp4';video.write_bytes(b'candidate video artifact')
         digest=hashlib.sha256(video.read_bytes()).hexdigest()
         manifest={'status':'preview_ready','run_id':job_id,'video':str(video),'sha256':digest,
+            'visual_mode':'hybrid','motion_system':'editorial-v2',
             'script_review':{'supported':True,'allowed_topic':True},
-            'scenes':[{'id':1}],'visual_review':{'video_sha256':digest,'publishable':True,
-            'score_1_to_5':4,'scenes':[{'id':1,'matches_narration':True,'meaningful_action_or_edit':True}]}}
+            'scenes':[{'id':1,'visual_type':'hybrid'},{'id':2,'visual_type':'motion'}],'visual_review':{'video_sha256':digest,'publishable':True,
+            'score_1_to_5':4,'scenes':[{'id':i,'matches_narration':True,'meaningful_action_or_edit':True} for i in (1,2)]}}
         (folder/'manifest.json').write_text(json.dumps(manifest))
         (folder/'script.json').write_text(json.dumps({'youtube_meta':{'title':'title','description':'description','tags':[]}}))
         return manifest
@@ -42,6 +43,49 @@ class ScheduleTests(unittest.TestCase):
             w.tick()
         state=json.loads(self.state.read_text())['wrongdev']
         self.assertEqual(state['next_due'],10800);self.assertIn('job',state);upload.assert_not_called()
+
+    def test_two_hour_interval_is_measured_from_real_publication_and_survives_another_tick(self):
+        cfg=json.loads(self.config.read_text());cfg['wrongdev']['publish_interval_seconds']=7200
+        self.config.write_text(json.dumps(cfg))
+        with patch.object(w,'run_pipeline',side_effect=self.generate),patch.object(w,'upload_video',return_value={'url':'https://youtu.be/id'}) as upload:
+            w.tick();w.tick()
+        self.assertEqual(upload.call_count,1)
+        saved=json.loads(self.state.read_text())['wrongdev']
+        self.assertEqual(saved['next_due']-saved['last_published_at'],7200)
+
+    def test_shorter_interval_retimes_existing_slot_without_losing_a_prepared_job(self):
+        cfg=json.loads(self.config.read_text());cfg['wrongdev']['publish_interval_seconds']=7200
+        self.config.write_text(json.dumps(cfg))
+        self.generate(job_id='prepared')
+        self.state.write_text(json.dumps({'wrongdev':{'last_published_at':3000,'next_due':13800,'job':'prepared','attempts':0}}))
+        with patch.object(w,'run_pipeline') as generate,patch.object(w,'upload_video',return_value={'url':'https://youtu.be/id'}) as upload:w.tick()
+        generate.assert_not_called();upload.assert_called_once()
+        self.assertEqual(json.loads(self.state.read_text())['wrongdev']['next_due'],18001)
+
+    def test_cheap_timer_check_uses_new_interval_before_the_state_is_rewritten(self):
+        (self.data/'media_brands.json').write_text(json.dumps({'wrongdev':{'video_enabled':True,'publish_interval_seconds':7200,'prepare_lead_seconds':0},'migratoria':{'youtube_channel_id':'known'}}))
+        (self.data/'media_schedule.json').write_text(json.dumps({'wrongdev':{'next_due':13800,'last_published_at':3000}}))
+        self.assertTrue(w.nothing_due(self.base,now=10199))
+        self.assertFalse(w.nothing_due(self.base,now=10200))
+
+    def test_provider_wait_preserves_job_and_automatically_resumes_after_availability_deadline(self):
+        from video_provider_pool import IncludedProvidersUnavailable
+        wait=IncludedProvidersUnavailable({'flow0':{'reason':'quota_exhausted'}},20000)
+        with patch.object(w,'run_pipeline',side_effect=wait),patch.object(w,'upload_video') as upload:
+            w.tick()
+        saved=json.loads(self.state.read_text())['wrongdev'];job=saved['job']
+        self.assertEqual(saved['retry_after'],20000);self.assertEqual(saved['next_due'],10800)
+        upload.assert_not_called()
+        with patch.object(w.time,'time',return_value=19999),patch.object(w,'run_pipeline') as generate:
+            w.tick()
+        generate.assert_not_called()
+        with patch.object(w.time,'time',return_value=20000),patch.object(w,'run_pipeline',side_effect=self.generate) as generate, \
+                patch.object(w,'upload_video',return_value={'url':'https://youtu.be/id','status':'success'}) as upload:
+            w.tick()
+        self.assertEqual(generate.call_args.kwargs['job_id'],job);upload.assert_called_once()
+        saved=json.loads(self.state.read_text())['wrongdev']
+        self.assertNotIn('job',saved);self.assertNotIn('retry_after',saved)
+        self.assertEqual(saved['next_due'],30800)
 
     def test_exhausted_narration_holds_source_without_advancing_due_slot(self):
         from bundled_voiceover import NarrationNeedsReview
@@ -58,6 +102,14 @@ class ScheduleTests(unittest.TestCase):
         self.assertNotIn('job',state);self.assertEqual(state['next_due'],10800)
         self.assertIn('1',json.loads((self.data/'review_held_video_sources.json').read_text())['wrongdev'])
         upload.assert_not_called()
+    def test_legacy_ready_video_is_held_for_style_upgrade_without_upload_or_advancing_due(self):
+        def legacy(job_id=None,**kw):
+            manifest=self.generate(job_id,**kw);manifest.pop('motion_system');return manifest
+        with patch.object(w,'run_pipeline',side_effect=legacy),patch.object(w,'upload_video') as upload:w.tick()
+        state=json.loads(self.state.read_text())['wrongdev'];upload.assert_not_called()
+        self.assertNotIn('job',state);self.assertEqual(state['next_due'],10800)
+        held=json.loads((self.base/'output/runs'/state['last_held_job']/'manifest.json').read_text())
+        self.assertEqual(held['status'],'held_for_style_upgrade')
     def test_rejected_visual_review_holds_only_that_source_instead_of_rerendering_forever(self):
         from video_quality import VisualReviewNeedsReview
         with patch.object(w,'run_pipeline',side_effect=VisualReviewNeedsReview('score 2/5 is below the 3/5 publication bar')),patch.object(w,'upload_video') as upload:w.tick()
@@ -122,6 +174,19 @@ class ScheduleTests(unittest.TestCase):
         with patch.object(w,'run_pipeline') as generate,patch.object(w,'upload_video',return_value={'url':'https://youtu.be/id','status':'success'}) as upload:w.tick()
         generate.assert_not_called();self.assertEqual(upload.call_count,1)
 
+    def test_configured_early_preparation_preserves_deadline_and_does_not_publish_early(self):
+        config=json.loads(self.config.read_text());config['wrongdev']['prepare_lead_seconds']=7200
+        self.config.write_text(json.dumps(config))
+        with patch.object(w.time,'time',return_value=4000),patch.object(w,'run_pipeline',side_effect=self.generate) as generate,patch.object(w,'upload_video') as upload:w.tick()
+        generate.assert_called_once();upload.assert_not_called()
+        self.assertEqual(json.loads(self.state.read_text())['wrongdev']['next_due'],10800)
+
+    def test_configured_lead_is_observed_by_the_cheap_timer_check(self):
+        (self.data/'media_brands.json').write_text(json.dumps({'wrongdev':{'video_enabled':True,'prepare_lead_seconds':7200},'migratoria':{'youtube_channel_id':'known'}}))
+        (self.data/'media_schedule.json').write_text(json.dumps({'wrongdev':{'next_due':10800}}))
+        self.assertTrue(w.nothing_due(self.base,now=3500))
+        self.assertFalse(w.nothing_due(self.base,now=4000))
+
     def test_late_publication_does_not_cause_a_nearby_catch_up_upload(self):
         with patch.object(w.time,'time',return_value=21500),patch.object(w,'run_pipeline',side_effect=self.generate),patch.object(w,'upload_video',return_value={'url':'https://youtu.be/id','status':'success'}):w.tick()
         saved=json.loads(self.state.read_text())['wrongdev']
@@ -144,8 +209,9 @@ class ScheduleTests(unittest.TestCase):
         digest=hashlib.sha256(video.read_bytes()).hexdigest()
         manifest=json.loads((folder/'manifest.json').read_text())
         manifest.update(status='preview_ready',video=str(video),sha256=digest,script_review={'supported':True,'allowed_topic':True},
-            scenes=[{'id':1}],visual_review={'video_sha256':digest,'publishable':True,'score_1_to_5':3,
-            'scenes':[{'id':1,'matches_narration':True,'meaningful_action_or_edit':True}]})
+            visual_mode='hybrid',motion_system='editorial-v2',
+            scenes=[{'id':1,'visual_type':'hybrid'},{'id':2,'visual_type':'motion'}],visual_review={'video_sha256':digest,'publishable':True,'score_1_to_5':3,
+            'scenes':[{'id':i,'matches_narration':True,'meaningful_action_or_edit':True} for i in (1,2)]})
         manifest.pop('error',None)
         (folder/'manifest.json').write_text(json.dumps(manifest))
         (folder/'script.json').write_text(json.dumps({'youtube_meta':{'title':'held title','description':'d','tags':[]}}))

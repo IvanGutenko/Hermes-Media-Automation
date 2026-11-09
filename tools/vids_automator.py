@@ -10,8 +10,8 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from playwright.async_api import async_playwright
-from browser_session import connect
+from playwright.async_api import async_playwright, expect
+from browser_session import connect, hide_heavy_tabs, set_frozen
 
 OUTPUT_DIR = Path('/data/output')
 
@@ -24,6 +24,51 @@ def save(path, value):
 def verified_file(state, target):
     return (state.get('status')=='completed' and target.is_file()
             and hashlib.sha256(target.read_bytes()).hexdigest()==state.get('sha256'))
+
+
+class FeatureUnavailable(RuntimeError):
+    pass
+
+
+async def open_generation_panel(page,state):
+    """Handle a chooser or a blank editor; do not wait forever for a missing feature.
+
+    Account 1's loaded start screen has avatar/voice/image tools but no video
+    generation option. Confirm this again after reloading before declaring the
+    provider unavailable. This helper is only used before any submission.
+    """
+    for observation in range(2):
+        create=page.get_by_role('button',name=re.compile(r'^(Create AI videos|Создание ИИ-видео|Создать ИИ-видео)'))
+        portrait=page.get_by_role('button',name=re.compile(r'^(Create a portrait video|Создать вертикальное видео|Вертикальное)$'))
+        rename=page.get_by_role('textbox',name=re.compile(r'^(Rename|Переименовать)$'))
+        await create.or_(portrait).or_(rename).first.wait_for(timeout=60000)
+        if await create.is_visible():
+            if await portrait.is_visible():await portrait.click()
+            await create.click();return
+        blank=page.get_by_role('button',name=re.compile(r'^(Blank vid|Пустой файл Vids)$'))
+        if await portrait.is_visible() and await blank.is_visible():
+            # A loaded chooser itself shows which features this account has.
+            # Do not change orientation or open Blank when AI video is absent:
+            # that can disable/rebuild the cards during the second observation.
+            await expect(blank).to_be_enabled(timeout=60000)
+            surface='start_chooser'
+        else:
+            await rename.wait_for(timeout=30000)
+            box=page.get_by_role('textbox',name=re.compile(r'^(Describe|Опишите видео)'))
+            if await box.is_visible():return
+            reopen=page.get_by_role('button',name=re.compile(r'^(Generate an AI video clip|Сгенерировать видеоклип от ИИ)$'))
+            if await reopen.is_visible():
+                await reopen.click();return
+            # Login/network/loading failures remain uncertain.
+            voice=page.get_by_role('button',name=re.compile(r'^(Generate a voiceover|Сгенерировать закадровую речь)$'))
+            await voice.wait_for(timeout=20000)
+            surface='editor'
+        state.setdefault('availability_observations',[]).append({
+            'observed_at':time.time(),'url':page.url,
+            'body':await page.locator('body').inner_text(timeout=15000),
+            'video_option_visible':False,'surface':surface,'surface_ready':True})
+        if observation==0:await page.reload(wait_until='domcontentloaded',timeout=45000)
+    raise FeatureUnavailable('Vids AI video option is absent in two loaded start/editor observations; no generation submitted')
 
 
 async def generate_vids_video(prompt, title='AI Video', *, run_id=None, account=1, timeout_seconds=420):
@@ -55,17 +100,23 @@ async def generate_vids_video(prompt, title='AI Video', *, run_id=None, account=
                     state['document_url']=page.url.split('?')[0]
                     if state['status']=='new':state.update(status='document_created',phase='document_created')
                     save(receipt,state)
+                else:
+                    await set_frozen(page, False)
                 page.set_default_timeout(20000)
+                if state.get('submission_attempted_at') or state.get('submitted_at'):
+                    # A reloaded document opens its canvas, not the generation sidebar.
+                    # Waiting seven minutes on that empty canvas blocks every publisher.
+                    await page.get_by_role('textbox',name=re.compile(r'^(Rename|Переименовать)$')).wait_for(timeout=60000)
+                    generated=page.get_by_role('button',name=re.compile(r'^(Generated video (?:for|from) prompt|Сгенерированное видео по запросу)'))
+                    box=page.get_by_role('textbox',name=re.compile(r'^(Describe|Опишите видео)'))
+                    if not await generated.count() and not await box.count():
+                        reopen=page.get_by_role('button',name=re.compile(r'^(Generate an AI video clip|Сгенерировать видеоклип от ИИ)$'))
+                        try:await reopen.click(timeout=20000)
+                        except Exception as exc:
+                            raise RuntimeError('Saved Vids document has no accessible generation panel; original request retained') from exc
                 if not state.get('submission_attempted_at') and not state.get('submitted_at'):
-                    create=page.get_by_role('button',name=re.compile(r'^(Create AI videos|Создание ИИ-видео)'))
-                    if state.get('phase',state['status'])=='document_created':
-                        await create.wait_for(timeout=60000)
-                        portrait=page.get_by_role('button',name=re.compile(r'^(Create a portrait video|Вертикальное)$'))
-                        if await portrait.is_visible():await portrait.click()
-                        await create.click()
-                        state['phase']='configured';save(receipt,state)
-                    elif not await page.get_by_role('textbox',name=re.compile(r'^(Describe|Опишите видео)')).count():
-                        await page.get_by_role('button',name=re.compile(r'^(Generate an AI video clip|Сгенерировать видеоклип от ИИ)$')).click()
+                    await open_generation_panel(page,state)
+                    state['phase']='configured';save(receipt,state)
                     rename=page.get_by_role('textbox',name=re.compile(r'^(Rename|Переименовать)$'))
                     await rename.fill('Media Factory '+run_id)
                     settings=page.get_by_role('button',name=re.compile(r'^(Generation settings|Настройки генерации):'))
@@ -124,10 +175,23 @@ async def generate_vids_video(prompt, title='AI Video', *, run_id=None, account=
                     # The validated MP4 is already durable even if saving its Vids canvas fails.
                     state['document_insert_unverified']=True;save(receipt,state)
             except Exception as exc:
+                if isinstance(exc,FeatureUnavailable):
+                    state.update(failure_kind='feature_unavailable',terminal_failure_observed=True)
                 state.update(status='error',error=str(exc));save(receipt,state)
             finally:
-                if page and (state.get('status')=='completed' or state.get('terminal_failure_observed')):await page.close()
-                await browser.close()
+                if page:
+                    try:
+                        if (state.get('status')=='completed' or state.get('terminal_failure_observed')
+                                or not (state.get('submission_attempted_at') or state.get('submitted_at'))):
+                            await asyncio.wait_for(page.close(),5)
+                        else:
+                            # Keep the unsaved result recoverable, but stop a retained editor
+                            # from faulting its swapped pages back in throughout the next jobs.
+                            await set_frozen(page, True)
+                        await asyncio.wait_for(hide_heavy_tabs(ctx),5)
+                    except Exception:pass
+                try:await asyncio.wait_for(browser.close(),5)
+                except Exception:pass
     return state
 
 

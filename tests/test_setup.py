@@ -55,7 +55,12 @@ class SubscriptionTests(unittest.TestCase):
         config = configuration({'EOS': {'type': 'file', 'path': '/test.yaml'}}, 'secret')
         self.assertFalse(config['allow-lan'])
         self.assertEqual(config['bind-address'], '127.0.0.1')
-        self.assertEqual(config['rules'][-1], 'MATCH,AI')
+        self.assertEqual(config['rules'][-1], 'MATCH,DIRECT')
+        self.assertIn('DOMAIN-SUFFIX,groq.com,AI', config['rules'])
+        self.assertIn('DOMAIN-SUFFIX,t.me,AI', config['rules'])
+        self.assertIn('DOMAIN-SUFFIX,telesco.pe,AI', config['rules'])
+        self.assertIn('DOMAIN-SUFFIX,cloudcode-pa.googleapis.com,ANTIGRAVITY', config['rules'])
+        self.assertIn('DOMAIN-SUFFIX,googleapis.com,GEMINI', config['rules'])
         listener = next(x for x in config['listeners'] if x['name']=='health-probe')
         self.assertEqual((listener['listen'], listener['port'], listener['proxy']),
                          ('127.0.0.1', 17891, 'PROBE'))

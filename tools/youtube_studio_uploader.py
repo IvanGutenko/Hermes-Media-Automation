@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import async_playwright, expect, TimeoutError as PlaywrightTimeoutError
 from browser_session import connect
 
 ROOT = Path('/data/output')
@@ -53,7 +53,8 @@ async def await_public(state, timeout=90):
 async def ensure_channel(page, state):
     channel = state['channel_id']
     create=page.get_by_role('button',name=re.compile(r'^(Create|Создать)$'))
-    if (f'/channel/{channel}' in page.url and await create.is_visible()
+    # The profile editor also shows Create, but its own fields and Publish button get in the way of an upload.
+    if (f'/channel/{channel}' in page.url and '/editing/' not in page.url and await create.is_visible()
             and state['channel_title'] in await page.locator('body').inner_text()):
         return
     # Studio's permission-denied page has no account menu. Select the actual
@@ -83,19 +84,29 @@ async def ensure_channel(page, state):
         raise RuntimeError('YouTube Studio selected a different channel')
 
 
+async def reopen_draft(page,state):
+    """All uploads share one Studio tab, so another brand's upload can close the dialog of a video still waiting for its
+    checks. The saved private video stays a draft and reopens in the same dialog: nothing is uploaded again."""
+    await ensure_channel(page,state)
+    await page.goto('https://studio.youtube.com/video/'+state['id']+'/edit',wait_until='commit',timeout=30000)
+    await page.get_by_role('button',name=re.compile(r'^(Редактировать черновик|Edit draft)$')).click(timeout=30000)
+
+
 async def publish_ready(page,state,receipt):
     state.update(status='awaiting_checks',desired_visibility='public');save(receipt,state)
-    warning=page.get_by_role('button',name=re.compile(r'^(Publish anyway|Все равно опубликовать|Всё равно опубликовать)$'))
+    # Scoped to the upload dialog: the profile editor behind it has its own "Publish" button.
+    dialog=page.locator('ytcp-uploads-dialog')
+    warning=dialog.get_by_role('button',name=re.compile(r'^(Publish anyway|Все равно опубликовать|Всё равно опубликовать)$'))
     if await warning.is_visible():
-        await page.get_by_role('button',name=re.compile(r'^(Go back|Назад)$')).last.click()
+        await dialog.get_by_role('button',name=re.compile(r'^(Go back|Назад)$')).last.click()
     await expect(page.locator('body')).to_contain_text(re.compile(
         r'Checks complete\.\s*No issues found|Проверка завершена\.\s*(?:Нарушений не обнаружено|Нарушений не найдено|Нарушений нет|Проблем не найдено)',re.S),timeout=600000)
-    public=page.get_by_role('radio',name=re.compile(r'^(Открытый доступ|Public)$'))
+    public=dialog.get_by_role('radio',name=re.compile(r'^(Открытый доступ|Public)$'))
     await public.click()
     await expect(public).to_have_attribute('aria-checked','true')
     state.update(status='publishing',publish_requested_at=time.time(),containsSyntheticMedia=True)
     save(receipt,state)
-    await page.get_by_role('button',name=re.compile(r'^(Опубликовать|Publish)$')).click()
+    await dialog.get_by_role('button',name=re.compile(r'^(Опубликовать|Publish)$')).click()
     await await_public(state)
     state.update(status='published',published_at=time.time(),publication_time_basis='public readback')
     save(receipt,state)
@@ -105,6 +116,12 @@ async def publish_ready(page,state,receipt):
 LANGUAGE_PATTERNS={'ru':(r'Русский|Russian',r'^(Русский|Russian)$'),'en':(r'English|Английский',r'^(English|Английский)( \(.*\))?$')}
 # options tried first when the list holds regional variants (the button text itself is matched with the first pattern)
 LANGUAGE_PREFERENCE={'en':('English','English (United States)')}
+
+
+def visibility_ready(state, job):
+    return (state.get('status') in ('uploaded_private','awaiting_checks','publishing')
+        and bool(state.get('id'))
+        and state.get('original_audio_language') == job.get('language','ru'))
 
 
 async def upload(job):
@@ -142,12 +159,16 @@ async def upload(job):
                 # A background tab never renders, so Playwright's "stable" check on it times out.
                 await page.bring_to_front()
                 page.set_default_timeout(20000)
-                if state['status'] in ('uploaded_private','awaiting_checks','publishing') and state.get('id') and state.get('original_audio_language')=='ru':
+                if visibility_ready(state, job):
                     # A normal YouTube check can take over five minutes. Resume
                     # the same saved upload after a bounded wait, without trying
                     # to re-enter Details into a Visibility-only dialog.
-                    link=page.get_by_role('link',name=re.compile(re.escape(state['id'])))
-                    await link.wait_for(timeout=10000)
+                    # Scoped to the dialog: the video's own edit page shows a link with this id as well.
+                    link=page.locator('ytcp-uploads-dialog').get_by_role('link',name=re.compile(re.escape(state['id'])))
+                    try:await link.wait_for(timeout=10000)
+                    except PlaywrightTimeoutError:
+                        await reopen_draft(page,state)
+                        await link.wait_for(timeout=30000)
                     public=page.get_by_role('radio',name=re.compile(r'^(Открытый доступ|Public)$'))
                     for _ in range(3):
                         if await public.is_visible():break
@@ -191,8 +212,10 @@ async def upload(job):
                     raise RuntimeError('Upload dialog belongs to another video')
                 state.update(id=video_id, url='https://youtu.be/' + video_id, status='uploaded_private')
                 save(receipt, state)
-                await page.get_by_role('textbox', name=re.compile(r'^(Укажите название|Add a title)')).fill(job['title'])
-                await page.get_by_role('textbox', name=re.compile(r'^(Расскажите, о чем|Tell viewers about)')).fill(job['description'])
+                # Scoped to the upload dialog: a tab left on the channel's profile editor has more "title" fields behind it.
+                details = page.locator('ytcp-uploads-dialog')
+                await details.get_by_role('textbox', name=re.compile(r'^(Укажите название|Add a title)')).fill(job['title'])
+                await details.get_by_role('textbox', name=re.compile(r'^(Расскажите, о чем|Tell viewers about)')).fill(job['description'])
                 await page.get_by_role('radio', name=re.compile(r'^(Нет, это видео не для детей|No, it.s not made for kids)$')).click()
                 more = page.get_by_text(re.compile(r'^(Развернуть|Show more)$'), exact=True)
                 if await more.is_visible():
@@ -220,6 +243,21 @@ async def upload(job):
                     await page.get_by_role('button', name=re.compile(r'^(Далее|Next)$')).click()
                 await publish_ready(page,state,receipt)
                 await page.close()
+            except Exception as exc:
+                # Keep the original failure and the actual visible blocker. A
+                # timeout alone cannot tell a slow dialog from a platform notice.
+                diagnostic={'error':type(exc).__name__+': '+str(exc)[:1200],
+                            'channel_id':state['channel_id'],'observed_at':time.time()}
+                try:
+                    diagnostic['url']=page.url.split('?')[0]
+                    visible=await asyncio.wait_for(page.locator('body').inner_text(timeout=5000),6)
+                    diagnostic['visible_text']=re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[email]',visible)[-12000:]
+                    await asyncio.wait_for(page.screenshot(path=str(receipt.with_suffix('.failure.png')),timeout=5000),6)
+                except Exception as capture:
+                    diagnostic['capture_error']=type(capture).__name__
+                try:save(receipt.with_suffix('.failure.json'),diagnostic)
+                except OSError:pass
+                raise
             finally:
                 await browser.close()
     return state

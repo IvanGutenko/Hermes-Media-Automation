@@ -60,12 +60,17 @@ class AutoposterApp:
         logger.info("=" * 60)
 
         # 1. Инициализация Application с поддержкой прокси для команд и сообщений
-        request = HTTPXRequest(proxy=config.proxy, connect_timeout=15.0, read_timeout=30.0)
+        # Long polling must not occupy the pool used by channel publication,
+        # analytics, and admin responses. Each client owns its own lifecycle.
+        request = HTTPXRequest(proxy=config.proxy, connect_timeout=15.0,
+            read_timeout=30.0, connection_pool_size=8, pool_timeout=15.0)
+        polling_request = HTTPXRequest(proxy=config.proxy, connect_timeout=15.0,
+            read_timeout=40.0, connection_pool_size=1, pool_timeout=15.0)
         self.tg_app = (
             ApplicationBuilder()
             .token(config.bot_token)
             .request(request)
-            .get_updates_request(request)
+            .get_updates_request(polling_request)
             .build()
         )
 
@@ -190,6 +195,14 @@ class AutoposterApp:
                     key_topic=key_topic,
                     metadata={"source": ch, "source_id": msg_id, "topic": key_topic, "media_urls": media_urls}
                 )
+
+                # growth_post_draft: only a newly written, persisted draft is
+                # attributed; historical queued posts are never retro-tagged.
+                try:
+                    from growth_actions import record
+                    record('wrongdev', 'post_draft', result.get('growth_actions', {}), source_id='post-' + str(db_id))
+                except Exception as exc:
+                    logger.warning('Editorial assignment record unavailable: %s', type(exc).__name__)
 
             # 3. Публикация очереди pending
             posted_count = 0

@@ -157,7 +157,7 @@ class FeedbackTests(unittest.TestCase):
             (data/'content_feedback.json').write_text(json.dumps(payload))
             with patch.object(feedback,'DATA',data):brief=feedback.editorial_brief('migratoria')
             parsed=json.loads(brief.split(': ',1)[1])
-            self.assertEqual(set(parsed['platform_observations']),{'telegram','youtube','vk','dzen','reddit'})
+            self.assertEqual(set(parsed['platform_observations']),{'telegram','youtube','vk','dzen'})
 
     def test_dzen_impressions_are_not_views_or_the_next_articles_counters(self):
         from metrics_numbers import dzen_dashboard

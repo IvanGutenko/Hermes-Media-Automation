@@ -8,12 +8,16 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
+from datetime import datetime
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from script_generator import BASE_DIR, PROXIES
 from youtube_uploader import save
+from platform_policy import DISABLED_PLATFORMS,disabled_result
 from browser_process import run as run_browser,wait_for_lease,BrowserBusy
+from reddit_targets import configured as reddit_configured,destination as reddit_destination,same as same_reddit_target,cursor_name as reddit_cursor_name
 
 DATA=BASE_DIR/'data'
 CONFIG=DATA/'media_brands.json'
@@ -26,6 +30,13 @@ MAX_BROWSER_PUBLICATIONS=3   # per distribution run, so generation also gets the
 HOLD_MAX=6*3600
 LOGIN_HOLD=3600
 TERMINAL_RECEIPTS=('published','rejected_by_platform','abandoned_unverified','duplicate_removed')
+
+
+def account_interval(cfg,payload):
+    """Video cadence can change without accelerating editorial photo/text posts."""
+    if payload.get('video'):
+        return cfg.get('video_account_interval_seconds',cfg.get('account_interval_seconds',21600))
+    return cfg.get('account_interval_seconds',21600)
 
 
 def browser_contention(exc):
@@ -119,13 +130,13 @@ def update_reddit_cursor(path,source_id,published_at,url):
     save(path,{'source_id':source_id,'last_post_at':published_at,'url':url})
 
 
-def sync_reddit_cursor(path,username):
+def sync_reddit_cursor(path,target):
     # The browser can finish publication before the calling worker times out.
     # Its verified durable receipt must also count towards this profile's cadence.
     for receipt in (BASE_DIR/'output').glob('native_reddit_*.json'):
         if not re.fullmatch(r'native_reddit_[a-f0-9]{64}\.json',receipt.name):continue
         proof=json.loads(receipt.read_text())
-        if (proof.get('status')=='published' and proof.get('username','').casefold()==username.casefold()
+        if (proof.get('status')=='published' and same_reddit_target(reddit_destination(proof),target)
                 and proof.get('public_verified_at') and proof.get('url')):
             update_reddit_cursor(path,proof['source_id'],
                 proof.get('publication_attempted_at') or proof['public_verified_at'],proof['url'])
@@ -140,13 +151,45 @@ def checked(response,service):
     return body
 
 
+class TelegramSendUncertain(RuntimeError):
+    """Keep reconciling this source without holding unrelated editorial topics."""
+
+
+def telegram_text_key(text):
+    # Preserve every word, number and punctuation mark; only normalize whitespace.
+    return re.sub(r'\s+',' ',unicodedata.normalize('NFC',text or '')).strip()
+
+
+def telegram_readback(document,payload,state):
+    soup=BeautifulSoup(document,'html.parser');matches=[]
+    expected=telegram_text_key(state.get('sent_plain',state.get('sent_text')))
+    for msg in soup.select('.tgme_widget_message'):
+        text=msg.select_one('.tgme_widget_message_text')
+        if not text:continue
+        for br in text.find_all('br'):br.replace_with('\n')
+        if telegram_text_key(text.get_text())!=expected:continue
+        if payload.get('image') and not msg.select_one('.tgme_widget_message_photo_wrap'):continue
+        if payload.get('video') and not msg.select_one('.tgme_widget_message_video_player'):continue
+        post=msg.get('data-post','');date=msg.select_one('time[datetime]')
+        if not re.fullmatch(r'[^/]+/\d+',post) or not date:continue
+        try:published_at=datetime.fromisoformat(date['datetime']).timestamp()
+        except (ValueError,TypeError):continue
+        if published_at<state.get('send_requested_at',0)-300:continue
+        matches.append({'id':int(post.split('/')[-1]),'url':'https://t.me/'+post,
+                        'public_published_at':published_at})
+    return matches
+
+
 def telegram(cfg,payload,state,persist):
     token=os.environ.get(cfg['token_env'])
     if not token:raise RuntimeError('Telegram bot token is missing')
     root='https://api.telegram.org/bot'+token+'/'
     def call(method,data,files=None):
         try:return checked(requests.post(root+method,data=data,files=files,proxies=PROXIES,timeout=90),'Telegram')
-        except requests.RequestException:raise RuntimeError('Telegram network failure; receipt retained') from None
+        except requests.RequestException:
+            if state.get('status')=='sending':
+                raise TelegramSendUncertain('Telegram network failure after send intent; receipt retained') from None
+            raise RuntimeError('Telegram network failure before send; receipt retained') from None
     chat=call('getChat',{'chat_id':cfg['target']})['result']
     if chat['type']!='channel' or chat.get('username','').lower()!=cfg['target'].lstrip('@').lower():
         raise RuntimeError('Telegram target identity mismatch')
@@ -154,13 +197,18 @@ def telegram(cfg,payload,state,persist):
         return state
     if state.get('status')=='sending':
         # Reconcile a lost Bot API response against the public channel, never blindly resend.
-        page=requests.get('https://t.me/s/'+cfg['target'].lstrip('@'),proxies=PROXIES,timeout=30)
-        soup=BeautifulSoup(page.text,'html.parser')
-        for msg in soup.select('.tgme_widget_message'):
-            text=msg.select_one('.tgme_widget_message_text')
-            if text and text.get_text('\n',strip=True)==state.get('sent_plain',state.get('sent_text')):
-                state.update(id=int(msg['data-post'].split('/')[-1]),status='published',url='https://t.me/'+msg['data-post']);persist();return state
-        raise RuntimeError('Telegram send is uncertain; waiting for reconciliation, no duplicate send')
+        try:
+            page=requests.get('https://t.me/s/'+cfg['target'].lstrip('@'),proxies=PROXIES,timeout=30)
+            page.raise_for_status()
+        except requests.RequestException:
+            raise TelegramSendUncertain('Telegram public readback unavailable; no duplicate send') from None
+        matches=telegram_readback(page.text,payload,state)
+        observations=state.setdefault('reconciliation_observations',[])
+        observations.append({'at':time.time(),'matching_posts':len(matches),'http_status':page.status_code})
+        state['reconciliation_observations']=observations[-8:];persist()
+        if len(matches)==1:
+            state.update(matches[0],status='published',chat_id=chat['id'],reconciled_at=time.time());persist();return state
+        raise TelegramSendUncertain('Telegram send awaits unambiguous public readback; no duplicate send')
     text=payload['text']
     if payload.get('video'):
         text=payload['title']+'\n\n'+payload.get('source_url','')
@@ -168,7 +216,7 @@ def telegram(cfg,payload,state,persist):
     if len(text)>4096:raise ValueError('Telegram post is too long')
     if payload.get('image') and len(BeautifulSoup(text,'html.parser').get_text())>1024:
         raise ValueError('Photo caption exceeds Telegram limit')
-    state.update(status='sending',sent_text=text,sent_plain=BeautifulSoup(text,'html.parser').get_text() if payload.get('parse_mode')=='HTML' else text);persist()
+    state.update(status='sending',send_requested_at=time.time(),sent_text=text,sent_plain=BeautifulSoup(text,'html.parser').get_text() if payload.get('parse_mode')=='HTML' else text);persist()
     if payload.get('video'):
         with open(payload['video'],'rb') as stream:
             result=call('sendVideo',{'chat_id':chat['id'],'caption':text,'supports_streaming':'true'},files={'video':('short.mp4',stream,'video/mp4')})['result']
@@ -182,7 +230,7 @@ def telegram(cfg,payload,state,persist):
         data={'chat_id':chat['id'],'text':text,'link_preview_options':json.dumps({'is_disabled':True})}
         if payload.get('parse_mode'):data['parse_mode']=payload['parse_mode']
         result=call('sendMessage',data)['result']
-    state.update(id=result['message_id'],status='published',chat_id=chat['id'],url='https://t.me/'+chat['username']+'/'+str(result['message_id']))
+    state.update(id=result['message_id'],status='published',chat_id=chat['id'],public_published_at=result.get('date',time.time()),url='https://t.me/'+chat['username']+'/'+str(result['message_id']))
     persist();return state
 
 
@@ -246,8 +294,12 @@ def vk(cfg,payload,state,persist):
 
 
 def reddit(cfg,payload,state,persist):
+    if 'reddit' in DISABLED_PLATFORMS:return disabled_result('reddit')
     from reddit_format import platform_body
-    username=cfg['target'].removeprefix('u_')
+    target,username=reddit_configured(cfg)
+    if state.get('target') and not same_reddit_target(state['target'],target):
+        raise RuntimeError('Reddit receipt has another destination')
+    state['target']=target;persist()
     job=BASE_DIR/'output'/('reddit_native_job_'+state['key']+'.json')
     if not job.exists():
         payload=dict(payload)
@@ -258,32 +310,36 @@ def reddit(cfg,payload,state,persist):
             payload['text']=prepare_copy(payload,state['key'])
             if payload.get('video'):payload['video']=prepare_video(payload['video'],state['key'])
         raw=Path(payload.get('video') or payload['image']).resolve() if payload.get('video') or payload.get('image') else None
-        save(job,{'key':state['key'],'username':username,'source_id':payload['source_id'],
+        save(job,{'key':state['key'],'username':username,'target':target,'source_id':payload['source_id'],
             'title':payload['title'],'body':platform_body(payload['text']),
             'video':'/data/output/'+str(raw.relative_to((BASE_DIR/'output').resolve())) if payload.get('video') else None,
             'image':'/data/output/'+str(raw.relative_to((BASE_DIR/'output').resolve())) if payload.get('image') and not payload.get('video') else None,
             'sha256':hashlib.sha256(raw.read_bytes()).hexdigest() if raw else None})
+    saved_job=json.loads(job.read_text())
+    if not same_reddit_target(reddit_destination(saved_job),target) or saved_job['username']!=username:
+        raise RuntimeError('Frozen Reddit job has another destination or author')
     result=run_publisher(['docker','exec','video_factory_auth','python3','-u','/app/scripts/reddit_publisher.py',
         '/data/output/'+job.name],capture_output=True,text=True,timeout=480)
     native=BASE_DIR/'output'/('native_reddit_'+state['key']+'.json')
     if native.exists():
         proof=json.loads(native.read_text())
-        if proof.get('status')=='rejected_by_platform' and proof.get('username')==username:
+        if proof.get('status')=='rejected_by_platform' and proof.get('username')==username and same_reddit_target(reddit_destination(proof),target):
             state.update(status='rejected_by_platform',id=proof.get('id'),url=proof.get('url'),
                 platform_rejection=proof.get('platform_rejection'));persist()
             configs=json.loads(CONFIG.read_text())
             for settings in configs.values():
                 target=settings.get('publishing',{}).get('reddit',{})
-                if target.get('target')=='u_'+username:
+                if target.get('target') and same_reddit_target(target['target'],cfg['target']):
                     target.update(enabled=False,moderation_hold={'source_id':payload['source_id'],
                         'id':proof.get('id'),'reason':proof.get('last_error'),'observed_at':proof.get('platform_rejection_observed_at')})
             save(CONFIG,configs)
-            raise RuntimeError('Reddit removed the post; profile publication paused pending an allowed format')
+            raise RuntimeError('Reddit removed the post; this destination is paused pending an allowed format')
     if result.returncode:raise RuntimeError('Reddit receipt retained for reconciliation: '+result.stderr[-500:])
     acknowledged=json.loads(result.stdout.strip().splitlines()[-1])
     job_data=json.loads(job.read_text())
     if (not native.exists() or proof.get('status')!='published' or not proof.get('public_verified_at')
             or proof.get('username')!=username or proof.get('source_id')!=payload['source_id']
+            or not same_reddit_target(reddit_destination(proof),cfg['target'])
             or proof.get('sha256')!=job_data.get('sha256') or proof.get('url')!=acknowledged.get('url')):
         raise RuntimeError('Reddit has no matching durable public verification')
     state.update(status='published',id=proof['id'],url=proof['url'],
@@ -307,6 +363,12 @@ def native_social(platform,cfg,payload,state,persist):
     username=(cfg.get('target') or '').lstrip('@')
     if not username:raise RuntimeError(name+' account is not configured')
     job=BASE_DIR/'output'/(platform+'_native_job_'+state['key']+'.json')
+    if payload.get('video') and job.exists():
+        # A queued style upgrade must not silently send the frozen old file.
+        # Existing upload intents keep their identity until reconciled.
+        frozen=json.loads(job.read_text())
+        if frozen.get('sha256')!=hashlib.sha256(Path(payload['video']).read_bytes()).hexdigest():
+            raise RuntimeError(name+' existing upload belongs to an earlier master; receipt retained, no replacement sent')
     if not job.exists():
         media=payload.get('video') or payload.get('image')
         if not media:raise RuntimeError(name+' needs an image or a video')
@@ -346,42 +408,12 @@ def tiktok(cfg,payload,state,persist):return native_social('tiktok',cfg,payload,
 
 
 def reconcile_reddit():
-    """Observe previously acknowledged posts even while new submissions are held."""
-    path=DATA/'reddit_pending_jobs.json'
-    if not path.exists():return
-    failures=[]
-    for name in json.loads(path.read_text()):
-        job=BASE_DIR/'output'/name
-        if job.parent!=BASE_DIR/'output':raise ValueError('Reddit reconciliation job outside output')
-        data=json.loads(job.read_text());receipt=BASE_DIR/'output'/('native_reddit_'+data['key']+'.json')
-        configs=json.loads(CONFIG.read_text())
-        if any(x.get('publishing',{}).get('reddit',{}).get('moderation_hold')
-            and x['publishing']['reddit'].get('target')=='u_'+data['username'] for x in configs.values()):continue
-        previous=json.loads(receipt.read_text())
-        if previous.get('status') in ('rejected_by_platform','retired_rejected'):continue
-        if previous.get('status')!='published' and time.time()-previous.get('readback_attempted_at',0)<1800:continue
-        result=run_publisher(['docker','exec','video_factory_auth','python3','-u','/app/scripts/reddit_publisher.py',
-            '/data/output/'+job.name,'--read-only'],capture_output=True,text=True,timeout=120)
-        if result.returncode:
-            failures.append('Existing Reddit post is not publicly verified; no replacement sent: '+result.stderr[-220:]);continue
-        proof=json.loads(receipt.read_text())
-        if proof.get('status')!='published' or not proof.get('public_verified_at'):raise RuntimeError('Reddit public readback is missing')
-        update_reddit_cursor(DATA/'distribution'/('reddit_'+data['username']+'_cursor.json'),
-            data['source_id'],proof.get('publication_attempted_at') or proof['public_verified_at'],proof['url'])
-        configs=json.loads(CONFIG.read_text())
-        for cfg in configs.values():
-            target=cfg.setdefault('publishing',{}).setdefault('reddit',{'target':'u_'+data['username']})
-            if target.get('target')!='u_'+data['username']:continue
-            if target.get('moderation_hold'):continue
-            target.update(enabled=True,post_interval_seconds=86400,video_interval_seconds=86400)
-            target.setdefault('post_enabled',False);target.setdefault('video_enabled',False)
-            target['video_enabled' if proof.get('media_present') else 'post_enabled']=True
-            target.pop('reason',None)
-        save(CONFIG,configs)
-    if failures:raise RuntimeError('; '.join(failures))
+    """Compatibility for old callers; retired destinations are never read or re-enabled."""
+    return disabled_result('reddit')
 
 
 def publish(brand,platform,payload):
+    if platform in DISABLED_PLATFORMS:return disabled_result(platform)
     if platform=='telegram' and payload.get('video') and (
             payload.get('source_id','').startswith('video-') or '/output/runs/' in str(payload['video'])):
         raise RuntimeError('Generated Shorts are published to video platforms; Telegram receives editorial posts')
@@ -390,21 +422,27 @@ def publish(brand,platform,payload):
         if not allowed(payload.get('title','')+' '+payload.get('text','')):
             raise RuntimeError('Publication excluded by the owner topic policy')
     cfg=json.loads(CONFIG.read_text())[brand].get('publishing',{}).get(platform,{})
+    if payload.get('video') and cfg.get('video_enabled') is False:
+        return {'status':'disabled_content_kind','platform':platform,'kind':'video'}
     if cfg.get('moderation_hold'):return {'status':'paused','platform':platform,'reason':cfg['moderation_hold']}
     if not cfg.get('enabled'):return {'status':'needs_authorization','platform':platform}
-    reddit_cursor=DATA/'distribution'/('reddit_'+cfg.get('target','').removeprefix('u_')+'_cursor.json')
+    reddit_cursor=None
     if platform=='reddit':
+        target,_=reddit_configured(cfg)
+        reddit_cursor=DATA/'distribution'/reddit_cursor_name(target)
         reddit_cursor.parent.mkdir(parents=True,exist_ok=True)
-        sync_reddit_cursor(reddit_cursor,cfg.get('target','').removeprefix('u_'))
+        sync_reddit_cursor(reddit_cursor,target)
     if platform=='reddit' and reddit_cursor.exists():
         previous=json.loads(reddit_cursor.read_text())
         if previous.get('source_id')!=payload['source_id'] and time.time()-previous.get('last_post_at',0)<86400:
             return {'status':'scheduled','retry_after':previous['last_post_at']+86400}
-    account_cursor=DATA/'distribution'/(platform+'_'+(cfg.get('target') or '').lstrip('@')+'_cursor.json')
-    if platform in ('instagram','tiktok') and account_cursor.exists():
+    account_scoped=platform in ('instagram','tiktok') or (platform=='vk' and payload.get('video') and cfg.get('video_account_interval_seconds'))
+    account_target=str(cfg.get('target') or cfg.get('group_id') or '').lstrip('@')
+    account_cursor=DATA/'distribution'/(platform+'_'+account_target+('_video' if platform=='vk' else '')+'_cursor.json')
+    if account_scoped and account_cursor.exists():
         # Both brands may share one account: one account-wide cadence, like the shared Reddit profile.
         previous=json.loads(account_cursor.read_text())
-        wait=cfg.get('account_interval_seconds',21600)
+        wait=account_interval(cfg,payload)
         if previous.get('source_id')!=payload['source_id'] and time.time()-previous.get('last_post_at',0)<wait:
             return {'status':'scheduled','retry_after':previous['last_post_at']+wait}
     key=publication_key(brand,cfg,payload['source_id'],'video' if payload.get('video') else 'post')
@@ -415,6 +453,8 @@ def publish(brand,platform,payload):
         state=json.loads(path.read_text()) if path.exists() else {'key':key,'status':'new','source_id':payload['source_id']}
         if state.get('status')=='rejected_by_platform':return state
         def persist():save(path,state)
+        if platform=='telegram' and state.get('status')=='sending' and not state.get('send_requested_at'):
+            state.update(send_requested_at=path.stat().st_mtime,send_requested_at_source='legacy_receipt_mtime');persist()
         if not payload.get('video'):
             if 'payload' not in state:
                 frozen=dict(payload)
@@ -434,7 +474,7 @@ def publish(brand,platform,payload):
         else:raise RuntimeError('This platform has not passed its authorization and publication checks')
         if platform=='reddit' and result.get('status')=='published':
             update_reddit_cursor(reddit_cursor,payload['source_id'],result.get('published_at') or result['public_verified_at'],result['url'])
-        if platform in ('instagram','tiktok') and result.get('status')=='published':
+        if account_scoped and result.get('status')=='published':
             update_reddit_cursor(account_cursor,payload['source_id'],result.get('published_at') or time.time(),result['url'])
         state['confirmed_at']=time.time();persist()
         if result.get('status')=='published' and result.get('url'):_announce(brand,platform,payload,result)
@@ -447,16 +487,34 @@ def migration_post(for_video=False):
     if cfg.get('editorial_hold'):return
     if not cfg.get('publishing',{}).get('telegram',{}).get('enabled'):return
     with db() as con:
+        # A lost response belongs to this source. Continue readback on later ticks,
+        # while other reviewed topics retain their normal publication cadence.
+        pending=con.execute("SELECT * FROM posts WHERE state='telegram_pending' ORDER BY id LIMIT 3").fetchall()
+        for previous in pending:
+            try:result=publish('migratoria','telegram',migration_payload(previous))
+            except TelegramSendUncertain:continue
+            if result['status']=='published':
+                con.execute("UPDATE posts SET telegram_id=?,state='posted',published_at=? WHERE id=?",(result['id'],result.get('public_published_at',time.time()),previous['id']))
         last=con.execute('SELECT max(published_at) FROM posts WHERE telegram_id IS NOT NULL').fetchone()[0]
+        # Respect a possibly successful send too: never burst after an unknown response.
+        for row in con.execute("SELECT id FROM posts WHERE state='telegram_pending'").fetchall():
+            path,receipt=receipt_of('migratoria','telegram',cfg['publishing']['telegram'],'migration-post-'+str(row['id']),'post')
+            if receipt:last=max(last or 0,receipt.get('send_requested_at',path.stat().st_mtime))
         # A video due now must not wait for an unrelated Telegram timer while
         # promising a guide that has not been posted. Allow its reviewed guide
         # earlier, with an hour between Telegram posts to prevent a burst.
         if last and time.time()-last<(3600 if for_video else 10800):return
-        row=con.execute("SELECT * FROM posts WHERE state='ready' AND telegram_id IS NULL AND created_at>? ORDER BY id LIMIT 1",(time.time()-86400,)).fetchone()
-        if not row:return
-        result=publish('migratoria','telegram',add_post_image('migratoria',migration_payload(row)))
+        ready=con.execute("SELECT * FROM posts WHERE state='ready' AND telegram_id IS NULL AND created_at>? ORDER BY id LIMIT 8",(time.time()-86400,)).fetchall()
+        if not ready:return
+        from growth_actions import choose
+        row=choose('migratoria',[dict(r) for r in ready],platform='telegram',kind='post',consumer='post_queue_selection') or ready[0]
+        try:result=publish('migratoria','telegram',add_post_image('migratoria',migration_payload(row)))
+        except TelegramSendUncertain:
+            con.execute("UPDATE posts SET state='telegram_pending' WHERE id=?",(row['id'],))
+            print(json.dumps({'brand':'migratoria','source_post_id':row['id'],'status':'telegram_pending','new_sends_blocked_until_cadence':True}),flush=True)
+            return
         if result['status']=='published':
-            con.execute("UPDATE posts SET telegram_id=?,state='posted',published_at=? WHERE id=?",(result['id'],time.time(),row['id']))
+            con.execute("UPDATE posts SET telegram_id=?,state='posted',published_at=? WHERE id=?",(result['id'],result.get('public_published_at',time.time()),row['id']))
             print(json.dumps({'brand':'migratoria','telegram_post':result['url']},ensure_ascii=False),flush=True)
 
 
@@ -479,8 +537,14 @@ def add_post_image(brand,payload,media=None):
         items=json.loads(media) if isinstance(media,str) else media
         item=next((x for x in items if isinstance(x,dict) and x.get('type','photo')=='photo'),None)
         if item:
-            response=requests.get(item['url'],proxies=PROXIES,timeout=40)
-            if response.ok and response.headers.get('content-type','').startswith('image/'):
+            try:
+                response=requests.get(item['url'],proxies=PROXIES,timeout=40)
+            except requests.RequestException:
+                # Telegram CDN URLs may expire while a post is queued. The
+                # same topic can use the existing fresh-illustration path, as
+                # the Telegram publisher already does for missing source media.
+                response=None
+            if response is not None and response.ok and response.headers.get('content-type','').startswith('image/'):
                 folder=BASE_DIR/'output/post_images/source';folder.mkdir(parents=True,exist_ok=True)
                 target=folder/(hashlib.sha256((brand+payload['source_id']).encode()).hexdigest()+'.jpg')
                 target.write_bytes(response.content);path=str(target)
@@ -534,7 +598,7 @@ def distribute_posts(budget=None):
     configs=json.loads(CONFIG.read_text())
     failures=[]
     for brand,cfg in configs.items():
-        targets=[p for p in ('vk','reddit','instagram') if cfg.get('publishing',{}).get(p,{}).get('enabled')
+        targets=[p for p in ('vk','instagram') if cfg.get('publishing',{}).get(p,{}).get('enabled')
             and cfg['publishing'][p].get('post_enabled',True)]
         if not targets:continue
         if brand=='wrongdev':
@@ -556,6 +620,8 @@ def distribute_posts(budget=None):
             for receipt in (DATA/'distribution').glob(brand+'_'+platform+'_*.json'):
                 if not re.fullmatch(re.escape(brand+'_'+platform+'_')+r'[a-f0-9]{64}\.json',receipt.name):continue
                 value=json.loads(receipt.read_text())
+                if platform=='reddit' and value.get('key')!=publication_key(brand,cfg['publishing'][platform],value.get('source_id'),'post'):
+                    continue  # Pending profile receipts keep their original destination.
                 if value.get('status') in ('preparing','posted_unverified','sending','publishing') and not value.get('source_id','').startswith('video-'):
                     if abandon_if_stale(receipt,value,cursor_path,cursor,brand,platform):continue
                     pending.append(value)
@@ -614,7 +680,10 @@ def abandon_video_if_stale(path,value,brand,platform,now):
 def video_queue(brand,pcfg,platform,manifests,now):
     """(pending, unsent) for one account, newest first. Pending receipts are reconciled before anything new is sent."""
     pending,unsent=[],[]
-    fresh=[(p,m) for p,m in manifests if m.get('status')=='published' and m.get('youtube_url') and m.get('brand','wrongdev')==brand
+    from video_quality import uses_news_hybrid
+    # Owner's new style policy also applies to future cross-platform sends.
+    # Historical files and uncertain receipts stay intact; they are not resent.
+    fresh=[(p,m) for p,m in manifests if uses_news_hybrid(m) and m.get('status')=='published' and m.get('youtube_url') and m.get('brand','wrongdev')==brand
         and now-m.get('completed_at',m.get('started_at',0))<=VIDEO_WINDOW]
     for p,m in sorted(fresh,key=lambda item:-item[1].get('completed_at',item[1].get('started_at',0))):
         path,receipt=receipt_of(brand,platform,pcfg,'video-'+m['run_id'])
@@ -639,7 +708,7 @@ def distribute_videos(budget=None):
         try:return json.loads(path.read_text()).get('last_post_at',0)
         except (OSError,ValueError):return 0
     from video_quality import require_artifact
-    for platform in ('vk','instagram','tiktok','reddit'):
+    for platform in ('vk','instagram','tiktok'):
         # The brand served longest ago goes first, so two brands on one account take turns.
         for brand,cfg in sorted(configs.items(),key=lambda item:last_post(item[0],platform)):
             if budget[0]<=0:break
@@ -666,7 +735,7 @@ def distribute_videos(budget=None):
                     failures.append(brand+'/'+platform+': '+str(exc));_alert(brand,platform,exc);break
                 if result['status']=='published':
                     budget[0]-=1;note_success(platform,target,'video')
-                    save(DATA/'distribution'/f'{brand}_{platform}_video_cursor.json',{'run_id':manifest['run_id'],'last_post_at':time.time(),'publication':result['url']})
+                    save(DATA/'distribution'/f'{brand}_{platform}_video_cursor.json',{'run_id':manifest['run_id'],'last_post_at':result.get('published_at') or time.time(),'publication':result['url']})
                     print(json.dumps({'brand':brand,'platform':platform,'video':result['url']}),flush=True)
                 break
     if failures:raise RuntimeError('; '.join(failures))

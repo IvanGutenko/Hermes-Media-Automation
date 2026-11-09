@@ -15,7 +15,7 @@ import autonomous_video_pipeline as pipeline
 
 
 def package():
-    return {'scenes': [
+    data={'scenes': [
         {'video_prompt_en': 'Close-up of a monitor. A cursor selects a subscription card while the camera pushes in. No avatars are visible.',
          'voiceover_ru': 'Чат Джи Пи Ти открывает нужный раздел на экране',
          'on_screen_text_ru': 'ChatGPT 4.1', 'edit_note_ru': 'Резкая склейка'},
@@ -23,9 +23,14 @@ def package():
          'voiceover_ru': 'Теперь сравниваем результат и выбираем подходящий вариант',
          'on_screen_text_ru': 'OpenAI', 'edit_note_ru': 'Приближение'},
         {'video_prompt_en': 'A smartphone with a clean messaging interface floats over a dark desk as the camera gently pushes in.',
-         'voiceover_ru': 'Полный гайд по ссылке', 'on_screen_text_ru': '@WrongDevp', 'edit_note_ru': 'Финал'}],
+         'voiceover_ru': 'Теперь вы знаете главное', 'on_screen_text_ru': '@WrongDevp', 'edit_note_ru': 'Финал'}],
         'youtube_meta': {'title': 'ChatGPT 4.1 от OpenAI: что изменилось',
                          'description': 'Гайд: https://t.me/WrongDevp', 'tags': ['ChatGPT', 'OpenAI']}}
+    data.update(visual_mode='hybrid',motion_palette='cobalt',motion_system='editorial-v2')
+    for scene,kind,layout in zip(data['scenes'],['hybrid','motion','motion'],['spotlight','compare','kinetic']):
+        scene.update(visual_type=kind,motion={'layout':layout,'headline':'Суть изменения',
+            'items':['Первый вариант','Второй вариант'],'kicker':''})
+    return data
 
 
 class ScriptContractTests(unittest.TestCase):

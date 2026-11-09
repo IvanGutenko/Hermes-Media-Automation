@@ -294,7 +294,7 @@ class Storage:
                    FROM posts 
                    WHERE status='pending' AND posted_to_target=FALSE
                    ORDER BY id ASC LIMIT ?""",
-                (limit,),
+                (max(limit, 8) if limit == 1 else limit,),
             ).fetchall()
             result = []
             for r in rows:
@@ -314,7 +314,14 @@ class Storage:
                 else:
                     d["metadata"] = {}
                 result.append(d)
+            if limit == 1 and result:
+                import sys
+                sys.path.insert(0, '/home/gut/hermes-workspace/video_factory/scripts')
+                from growth_actions import choose
+                picked = choose('wrongdev', result, platform='telegram', kind='post', consumer='post_queue_selection')
+                return [picked] if picked is not None else result[:limit]
             return result
+
 
     def get_queue_count(self):
         with self.transaction() as conn:

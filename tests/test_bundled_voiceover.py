@@ -56,6 +56,25 @@ class NarrationRepairTests(unittest.TestCase):
         voice.check_scene_fits(7.8)
         for duration in (8.38,1.0):
             with self.assertRaises(voice.NarrationNeedsReview):voice.check_scene_fits(duration)
+
+    def test_only_a_correlated_observed_terminal_voice_failure_can_hold_the_source(self):
+        import hashlib
+        out=self.root/'output';out.mkdir()
+        rid='job_'+hashlib.sha256(self.script['voiceover_ru'].encode()).hexdigest()[:10]
+        receipt=out/('vids_voice_'+rid+'.json')
+        failed={'script':self.script['voiceover_ru'],'voice':'Holt',
+            'failure_kind':'voiceover_not_inserted','terminal_failure_observed':True,
+            'reconciliation_observations':[{'before_reload':{},'after_reload':{}}]}
+        result=type('Result',(),{'returncode':1,'stderr':'provider failure'})()
+        with patch.object(pipeline,'BASE_DIR',self.root),patch('browser_process.run',return_value=result):
+            receipt.write_text(json.dumps(failed))
+            with self.assertRaises(voice.NarrationNeedsReview):voice._prepare(self.script,self.run,'job')
+            for key,value in [('script','Другой текст'),('voice','Knox'),('terminal_failure_observed',False),
+                              ('reconciliation_observations',[])]:
+                receipt.write_text(json.dumps({**failed,key:value}))
+                with self.subTest(key=key),self.assertRaisesRegex(RuntimeError,'retained for retry') as caught:
+                    voice._prepare(self.script,self.run,'job')
+                self.assertNotIsInstance(caught.exception,voice.NarrationNeedsReview)
     def test_existing_visual_submission_prevents_rewriting_its_narration(self):
         routes=self.root/'generation_routes';routes.mkdir()
         (routes/'job_s1.json').write_text('{}')

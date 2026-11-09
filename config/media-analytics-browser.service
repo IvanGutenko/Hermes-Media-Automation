@@ -1,5 +1,5 @@
 [Unit]
-Description=Read browser-only audience numbers (Studio retention, VK, Dzen, Reddit) when the browser lease is free
+Description=Read browser-only audience numbers (Studio retention, VK, Dzen, TikTok, Instagram) when the browser lease is free
 After=network-online.target hermes-vpn.service
 Wants=hermes-vpn.service
 

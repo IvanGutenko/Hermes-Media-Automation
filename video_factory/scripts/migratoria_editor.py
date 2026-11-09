@@ -122,10 +122,16 @@ def extract(url):
             'sha256':hashlib.sha256(text.encode()).hexdigest(),'text':text}
 
 
-def llm(system,source,review=False):
+def llm(system,source,review=False,platform='telegram',kind='post'):
+    editorial_receipt={}
     if not review:
-        from content_feedback import editorial_brief
-        system += editorial_brief(os.getenv('MEDIA_BRAND','migratoria'))
+        from content_feedback import _feedback_brief
+        from growth_brief import prompt
+        brand=os.getenv('MEDIA_BRAND','migratoria')
+        from growth_actions import context
+        editorial=context(brand,platform=platform,kind=kind)
+        editorial_receipt=editorial['receipt']
+        system += _feedback_brief(brand)+(prompt(brand) if kind=='video' else '')+editorial['prompt']
     import text_llm
     # Owner model policy order with per-model cooldowns; Groq (TPD-limited) is last.
     # A factual review keeps its own single Groq model, the editor the configured list.
@@ -133,6 +139,7 @@ def llm(system,source,review=False):
         result,_=text_llm.complete([{'role':'system','content':system},{'role':'user','content':source}],
             groq_models=['openai/gpt-oss-120b'] if review else MODELS,max_tokens=2400,temperature=0.2,
             limit_file=BASE_DIR/'data/editorial_last_limit.json')
+        if not review:result['_growth_actions']=editorial_receipt
         return result
     except text_llm.Unavailable as exc:
         # The retry message below is all the job record keeps; the journal keeps which model said what.
@@ -356,7 +363,10 @@ def valid_fact_quotes(result,evidence):
     return money(result.get('title','')+' '+result.get('text',''))<=money(' '.join(f['quote'] for f in facts))
 
 
-def prepare_one(candidate_id=None):
+def prepare_one(candidate_id=None,budget=None):
+    # A budget stops before the next candidate; one candidate costs 2-4 min
+    # (model hint + editor call + slow official sites), so a hard kill wasted it.
+    started=time.time()
     with db() as con:
         if 'diagnostic' not in [r[1] for r in con.execute('PRAGMA table_info(candidates)')]:
             con.execute('ALTER TABLE candidates ADD COLUMN diagnostic TEXT')
@@ -365,7 +375,12 @@ def prepare_one(candidate_id=None):
         candidates=(con.execute('SELECT * FROM candidates WHERE id=?',(candidate_id,)).fetchall() if candidate_id is not None else
             con.execute("SELECT * FROM candidates WHERE state IN ('new','needs_primary_source') AND date>? ORDER BY coalesce(evidence_checked_at,0), CASE WHEN url LIKE '%t.me/relokatz/%' OR url LIKE '%t.me/ArkHelps/%' OR url LIKE '%t.me/emigriceps/%' THEN 0 WHEN url LIKE '%t.me/%' THEN 1 ELSE 2 END,id DESC LIMIT 8",
                 (datetime.fromtimestamp(time.time()-72*3600,timezone.utc).isoformat(),)).fetchall())
+        if candidate_id is None and len(candidates)>1:
+            from growth_actions import choose
+            picked=choose('migratoria',[dict(c) for c in candidates],platform='telegram',kind='post',consumer='post_research_selection')
+            if picked is not None:candidates=sorted(candidates,key=lambda c:c['id']!=picked['id'])
         for c in candidates:
+            if budget is not None and time.time()-started>=budget:break
             con.execute('UPDATE candidates SET evidence_checked_at=? WHERE id=?',(time.time(),c['id']))
             con.commit()  # Do not hold the publishing database write lock during network/model calls.
             if not allowed(c['text']):
@@ -441,7 +456,10 @@ conditions, including equipped aircraft when relevant. The failed draft is not e
                 WHERE posts.telegram_id IS NULL AND posts.video_run IS NULL''',
                 (c['url'],result['title'],text,json.dumps({'documents':evidence,'facts':facts,'review':review,'action_link':result.get('action_link',{})},ensure_ascii=False),time.time()))
             con.execute("UPDATE candidates SET state='prepared' WHERE id=?",(c['id'],))
-            return con.execute('SELECT id,title,text FROM posts WHERE source_url=?',(c['url'],)).fetchone()['id']
+            post_id=con.execute('SELECT id,title,text FROM posts WHERE source_url=?',(c['url'],)).fetchone()['id']
+            from growth_actions import record
+            record('migratoria','post_draft',result.get('_growth_actions',{}),source_id='migration-post-'+str(post_id))
+            return post_id
     return None
 
 

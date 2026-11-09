@@ -66,11 +66,19 @@ SYSTEM_PROMPT = """Ты — автор и технический редакто�
 SYSTEM_PROMPT += "\nНе добавляй подпись Источник или Source внизу поста. Полезные ссылки на сервис или репозиторий оставляй естественно в тексте. Политика тем владельца имеет приоритет над одобрением любой AI-новости.\n" + EDITORIAL_SCOPE
 
 
+from contextvars import ContextVar
+growth_post_receipt = ContextVar('growth_post_receipt', default={})
+
+
 def audience_instructions():
     import sys
     sys.path.insert(0, '/home/gut/hermes-workspace/video_factory/scripts')
-    from content_feedback import editorial_brief
-    return editorial_brief('wrongdev')
+    from content_feedback import _feedback_brief
+    from growth_actions import context
+    editorial = context('wrongdev', platform='telegram', kind='post')
+    growth_post_receipt.set(editorial['receipt'])
+    return _feedback_brief('wrongdev') + editorial['prompt']
+
 
 
 def strip_source_footer(text):
@@ -335,6 +343,7 @@ class PostProcessor:
             "html": formatted_html,
             "original_text": raw_text,
             "provider": provider_name,
+            "growth_actions": growth_post_receipt.get(),
         }
 
 

@@ -25,6 +25,15 @@ class BeforeSubmissionFailure(RuntimeError):
     """A stopped worker's durable receipt proves that no request was submitted."""
 
 
+class IncludedProvidersUnavailable(RuntimeError):
+    """Every eligible included provider is on an observed availability hold."""
+    def __init__(self,details,retry_after):
+        self.retry_after=retry_after
+        summary='; '.join(name+'='+str(value.get('reason','unknown')) for name,value in details.items())
+        super().__init__('All included video providers are unavailable ('+summary+'); automatic recheck '+
+            time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime(retry_after)))
+
+
 def artifact(data,prompt,voiceover_ru=None):
     if (data.get('status')!='completed' or data.get('prompt_sha256')!=hashlib.sha256(prompt.encode()).hexdigest()
             or not data.get('prompt_verified_in_editor') or not data.get('media_id')
@@ -124,5 +133,10 @@ def generate_video_file(prompt,title,run_id,resume=False,voiceover_ru=None,provi
                 raise BeforeSubmissionFailure('Video provider failed before submission: '+data.get('error','unknown error')[-500:])
             save(path,state)
             raise RuntimeError('Video provider request retained; no fallback after an uncertain result: '+data.get('error','unknown error')[-500:])
-        state.update(status='waiting_for_included_provider',checked_at=time.time());save(path,state)
-        raise RuntimeError('All included video providers are unavailable; waiting for recovery without purchases')
+        now=time.time();availability=holds()
+        details={p['id']:availability.get(p['id'],{}) for p in providers if not voiceover_ru or p['provider']=='flow'}
+        deadlines=[v['retry_after'] for v in details.values() if v.get('retry_after',0)>now]
+        retry_after=min(deadlines) if deadlines else now+900
+        state.update(status='waiting_for_included_provider',checked_at=now,
+            availability=details,retry_after=retry_after);save(path,state)
+        raise IncludedProvidersUnavailable(details,retry_after)

@@ -143,6 +143,7 @@ def speak(text, kind, lang, attempts=7, proxy=None):
     text = _clean(text)
     voice, pitch, rate, volume = voice_for(kind, lang)
     last = None
+    requested_voice = voice
     for attempt in range(attempts):
         try:
             audio, words = asyncio.run(asyncio.wait_for(_stream(text, voice, pitch, rate, volume, PROXY if proxy is None else proxy), 90))
@@ -152,9 +153,17 @@ def speak(text, kind, lang, attempts=7, proxy=None):
             fixed = [{'text': w['text'], 'start': max(0.0, w['start'] - shift), 'end': max(0.0, w['end'] - shift)} for w in words]
             duration = len(trimmed) / RATE
             if duration < 0.3:raise VoiceError('voice line is nearly silent')
-            return {'samples': trimmed, 'words': fixed, 'duration': duration, 'voice': voice}
+            return {'samples': trimmed, 'words': fixed, 'duration': duration, 'voice': voice, 'requested_voice': requested_voice,
+                'fallback_reason': 'primary_voice_no_audio' if voice != requested_voice else None}
         except Exception as exc:  # network, 403 token handshake, decoding: all worth a retry with backoff
             last = exc
+            # A native Russian fallback keeps the intended language when the
+            # provider accepts Dmitry's request but returns no audio. Preserve
+            # the requested and actual voice in the resulting line receipt.
+            if (type(exc).__name__ == 'NoAudioReceived' and voice == 'ru-RU-DmitryNeural'
+                    and attempt >= 1 and attempt + 1 < attempts):
+                voice = 'ru-RU-SvetlanaNeural'
+                pitch = min(pitch - 30, -8)
             if attempt + 1 < attempts:time.sleep(min(12.0, 2.0 * (attempt + 1)))  # the service answers 'no audio' in bursts; a longer pause clears it
     raise VoiceError(f'voice synthesis failed for {voice}: {type(last).__name__}: {last}')
 

@@ -19,6 +19,17 @@ class BrowserRecoveryTests(unittest.TestCase):
         issues=[p for p in report['problems'] if p['issue']=='instagram_publication_unverified']
         self.assertEqual([p['source_id'] for p in issues],['video-1'])
 
+    def test_lvl_video_cadence_is_checked_independently_of_its_news_worker_flag(self):
+        brands={'lvl':{'lvl_enabled':True,'video_enabled':False,'publish_interval_seconds':7200,
+            'languages':['ru','en'],'publishing':{'youtube':{'enabled':True}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);folder=root/'output/lvl_runs/episode';folder.mkdir(parents=True)
+            (folder/'manifest.json').write_text(json.dumps({'published':{'youtube:ru':{'at':time.time()-10800}}}))
+            report,_,_=self.run_health(root,ready=True,brands=brands)
+        overdue=[p for p in report['problems'] if p.get('issue')=='publication_overdue']
+        self.assertEqual([(p['brand'],p['platform']) for p in overdue],[('lvl','youtube')])
+        self.assertGreaterEqual(overdue[0]['seconds'],3600)
+
     def test_a_nearly_full_disk_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp,patch.object(health.shutil,'disk_usage',return_value=Mock(free=3*2**30)):
             report,_,_=self.run_health(Path(tmp),ready=True)
@@ -28,11 +39,11 @@ class BrowserRecoveryTests(unittest.TestCase):
         with patch('browser_process.run',side_effect=subprocess.TimeoutExpired('probe',60)):
             self.assertFalse(health.browser_ready())
 
-    def run_health(self,root,ready=False,restart_error=False):
+    def run_health(self,root,ready=False,restart_error=False,brands=None,order=None):
         data=root/'data';data.mkdir(exist_ok=True)
         output=root/'output';output.mkdir(exist_ok=True)
         (output/'.flow-generation.lock').touch()
-        for name,value in [('media_brands',{}),('media_schedule',{}),('content_feedback',{'errors':{}})]:
+        for name,value in [('media_brands',brands or {}),('media_schedule',{}),('content_feedback',{'errors':{}})]:
             (data/(name+'.json')).write_text(json.dumps(value))
         calls=[]
         def run(command,**kwargs):
@@ -40,9 +51,25 @@ class BrowserRecoveryTests(unittest.TestCase):
             if command[:2]==['docker','restart'] and restart_error:
                 raise subprocess.TimeoutExpired(command,45)
             return Mock(returncode=0,stdout='active\n')
-        with patch.object(health,'BASE_DIR',root),patch.object(health,'host_busy',return_value=self.busy),patch.object(health,'browser_ready',return_value=ready) as probe,patch.object(health.subprocess,'run',side_effect=run),patch('media_network.check',return_value={'status':'reachable'}):
+        def readiness():
+            if order is not None:order.append('probe')
+            return ready
+        with patch.object(health,'BASE_DIR',root),patch.object(health,'host_busy',return_value=self.busy),patch.object(health,'browser_ready',side_effect=readiness) as probe,patch.object(health.subprocess,'run',side_effect=run),patch('media_network.check',return_value={'status':'reachable'}):
             health.tick()
         return json.loads((data/'media_health.json').read_text()),calls,probe.call_count
+
+    def test_retired_reddit_moderation_is_not_an_active_fault_but_other_platforms_still_are(self):
+        brands={'wrongdev':{'publishing':{p:{'enabled':False,'moderation_hold':{'reason':'old rejection'}} for p in ('reddit','vk')}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            report,_,_=self.run_health(Path(tmp),ready=True,brands=brands)
+        self.assertEqual([p['platform'] for p in report['problems'] if p['issue']=='platform_moderation_hold'],['vk'])
+
+    def test_retired_reddit_account_holds_are_not_retried_or_reported_as_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);folder=root/'data/distribution';folder.mkdir(parents=True)
+            (folder/'target_holds.json').write_text(json.dumps({p+':account:video':{'fails':3,'until':time.time()+3600} for p in ('reddit','instagram')}))
+            report,_,_=self.run_health(root,ready=True)
+        self.assertEqual([p['target'] for p in report['problems'] if p['issue']=='platform_account_failing'],['instagram:account:video'])
 
     def test_repeated_attachment_failure_recovers_and_persists_the_real_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,24 +130,27 @@ class BrowserRecoveryTests(unittest.TestCase):
                 report,_,_=self.run_health(root,ready=True)
             park.assert_not_called();self.assertEqual(report['browser_parked'],0)
 
-    def test_an_unready_browser_is_not_parked(self):
-        with tempfile.TemporaryDirectory() as tmp,patch.object(health,'park_idle_browser') as park:
-            self.run_health(Path(tmp),ready=False)
-        park.assert_not_called()
+    def test_cleanup_precedes_readiness_so_orphan_pages_can_be_reclaimed_during_a_stall(self):
+        order=[]
+        with tempfile.TemporaryDirectory() as tmp,patch.object(health,'park_idle_browser',side_effect=lambda:order.append('cleanup') or 0) as park:
+            report,_,_=self.run_health(Path(tmp),ready=False,order=order)
+        park.assert_called_once()
+        self.assertEqual(order[:2],['cleanup','probe'])
+        self.assertEqual(report['browser_parked'],0)
+        self.assertTrue(any(p['issue']=='browser_attachment_unavailable' for p in report['problems']))
 
     def test_parking_never_touches_a_flow_project_page_that_may_hold_a_generation(self):
-        with patch('browser_process.run',return_value=Mock(returncode=0,stdout='1\n')) as run:
-            self.assertEqual(health.park_idle_browser(),1)
-        code=run.call_args.args[0][-1]
-        self.assertIn("'/project/' not in u.path",code);self.assertIn("u.netloc=='flow.google.com'",code)
-        self.assertIn(health.PARK_URL,code)
+        from test_browser_load import run_tidy,FLOW_PROJECT,ACCOUNT
+        log,count=run_tidy([ACCOUNT,FLOW_PROJECT,'https://www.youtube.com/watch?v=finished'])
+        self.assertEqual(log,[('close','https://www.youtube.com/watch?v=finished')])
+        self.assertEqual(count,1)
 
     def test_parking_also_leaves_the_autoplaying_instagram_and_tiktok_feeds(self):
-        with patch('browser_process.run',return_value=Mock(returncode=0,stdout='2\n')) as run:
-            self.assertEqual(health.park_idle_browser(),2)
-        code=run.call_args.args[0][-1]
-        self.assertIn("SOCIAL=('instagram.com','tiktok.com')",code);self.assertIn('u.netloc.endswith(SOCIAL)',code)
-        self.assertIn("'/project/' not in u.path",code)
+        from test_browser_load import run_tidy,FLOW_PROJECT,ACCOUNT
+        social=['https://www.instagram.com/','https://www.tiktok.com/']
+        log,count=run_tidy([ACCOUNT,FLOW_PROJECT]+social)
+        self.assertEqual(log,[('close',u) for u in social])
+        self.assertEqual(count,2)
 
     def test_a_timed_out_park_is_not_an_error(self):
         with patch('browser_process.run',side_effect=subprocess.TimeoutExpired('park',60)):

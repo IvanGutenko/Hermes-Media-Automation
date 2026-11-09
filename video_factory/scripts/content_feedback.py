@@ -14,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from script_generator import BASE_DIR,DB_PATH,PROXIES
 from youtube_uploader import save
+from platform_policy import DISABLED_PLATFORMS
 from browser_process import run as run_browser
 
 DATA=BASE_DIR/'data'
@@ -54,7 +55,7 @@ def inventory():
             'published_at':proof.get('published_at',proof.get('verified_at',m.get('completed_at'))),
             'voice':script.get('narration_voice') or ('Holt' if m.get('audio_mode')=='vids' else m.get('voice','unknown')),'duration':m.get('duration')})
     for path in (DATA/'distribution').glob('*.json'):
-        if not re.fullmatch(r'(wrongdev|migratoria)_(vk|reddit|instagram|tiktok)_[a-f0-9]{64}\.json',path.name):continue
+        if not re.fullmatch(r'(wrongdev|migratoria)_(vk|instagram|tiktok)_[a-f0-9]{64}\.json',path.name):continue
         p=json.loads(path.read_text())
         if p.get('status')!='published' or not p.get('url'):continue
         brand,platform=path.stem.split('_')[:2]
@@ -76,20 +77,22 @@ def inventory():
             platform,lang=key.split(':')
             items.append({'brand':'lvl','platform':platform,'kind':'video','lang':lang,'run_id':m['run_id'],'source_id':'lvl-'+m['run_id']+'-'+lang,
                 'title':episode.get('title_'+lang),'url':receipt['url'],'published_at':receipt.get('at'),'duration':(m.get('gates',{}).get(lang) or {}).get('duration')})
-    # Reconciled native submissions can predate the common distributor receipt.
-    known={item['url'] for item in items}
-    runs={item.get('run_id'):item['brand'] for item in items if item.get('run_id')}
-    for path in (BASE_DIR/'output').glob('native_reddit_*.json'):
-        if not re.fullmatch(r'native_reddit_[a-f0-9]{64}\.json',path.name):continue
-        proof=json.loads(path.read_text());source=proof.get('source_id','')
-        if proof.get('status')!='published' or not proof.get('public_verified_at') or not proof.get('url') or proof['url'] in known:continue
-        brand=runs.get(source.removeprefix('video-')) if source.startswith('video-') else ('migratoria' if source.startswith('migration-post-') else 'wrongdev')
-        if not brand:continue
-        items.append({'brand':brand,'platform':'reddit','kind':'video' if source.startswith('video-') else 'post',
-            'source_id':source,'title':proof.get('title'),'url':proof['url'],
-            'published_at':proof.get('publication_attempted_at',proof['public_verified_at'])})
-        known.add(proof['url'])
-    return items
+    # StoryWobble episodes: one Russian master per run, every confirmed platform URL.
+    for path in (BASE_DIR/'output/story_runs').glob('*/manifest.json'):
+        try:m=json.loads(path.read_text())
+        except (OSError,ValueError):continue
+        for platform,receipt in (m.get('published') or {}).items():
+            if not receipt.get('url'):continue
+            items.append({'brand':'storywobble','platform':platform,'kind':'video','run_id':m['run_id'],'source_id':'story-'+m['run_id'],
+                'title':m.get('title'),'url':receipt['url'],'published_at':receipt.get('at'),'duration':(m.get('gate') or {}).get('duration')})
+    # Historical receipts stay on disk, but retired platforms receive no new readings.
+    for path in (BASE_DIR/'output/lvl_posts').glob('*/post.json'):
+        post=json.loads(path.read_text());receipt=post.get('publication') or {}
+        if post.get('status')!='published' or not receipt.get('url'):continue
+        items.append({'brand':'lvl','platform':'telegram','kind':'post','lang':post['lang'],
+            'run_id':post['run_id'],'source_id':post['run_id'],'source_episode':post['source_episode'],'title':post['title'],'text':post['body'],
+            'url':receipt['url'],'published_at':post['published_at']})
+    return [item for item in items if item['platform'] not in DISABLED_PLATFORMS]
 
 
 def telegram_metrics(brand,handle):
@@ -110,9 +113,10 @@ def telegram_metrics(brand,handle):
     return result
 
 
-def editorial_brief(brand):
+def editorial_brief(brand,platform='youtube',kind='video',lang=''):
     from growth_brief import prompt
-    return _feedback_brief(brand)+prompt(brand)
+    from growth_actions import prompt as actions_prompt
+    return _feedback_brief(brand)+(prompt(brand) if kind=='video' else '')+actions_prompt(brand,platform=platform,kind=kind,lang=lang)
 
 
 def _feedback_brief(brand):
@@ -126,7 +130,7 @@ def _feedback_brief(brand):
         'platform_observations':{platform:[{'title':(row.get('title') or '')[:90],
             'age_hours':round(row['age_hours'],1) if row.get('age_hours') is not None else None,
             'metrics':row['metrics']} for row in rows[:1]]
-            for platform,rows in info.get('platform_observations',{}).items()},
+            for platform,rows in info.get('platform_observations',{}).items() if platform not in DISABLED_PLATFORMS},
         'measurement_errors':list(data.get('errors',{}))}
     try:
         diagnosis=json.loads((DATA/'growth_diagnosis.json').read_text())['brands'].get(brand,{})
@@ -137,6 +141,8 @@ def _feedback_brief(brand):
 
 
 def analyze(items,current=None):
+    items=[x for x in items if x['platform'] not in DISABLED_PLATFORMS]
+    if current is not None:current=[x for x in current if x['platform'] not in DISABLED_PLATFORMS]
     brands={}
     for brand in ('wrongdev','migratoria','lvl'):
         recent=[x for x in items if x['brand']==brand and x.get('metrics',{}).get('views') is not None]
@@ -163,11 +169,10 @@ def analyze(items,current=None):
             'median_percentage_viewed':statistics.median(values) if (values:=[x['metrics']['average_percentage_viewed'] for x in rows if x['metrics'].get('average_percentage_viewed') is not None]) else None,
             'status':'exploratory_no_winner' if len(rows)<6 or len(values)<6 else 'compare_retention_and_topic_before_scaling'}
             for voice,rows in experiments.items()]
-        # Preserve each platform's meaning and age. Dzen impressions and Reddit
-        # votes must be visible to the editor without being ranked as views.
+        # Preserve each platform's meaning and age; impressions are not views.
         observed=[x for x in (current or items) if x['brand']==brand and x.get('metrics')]
         platforms={}
-        for platform in ('telegram','youtube','vk','dzen','reddit','instagram','tiktok'):
+        for platform in ('telegram','youtube','vk','dzen','instagram','tiktok'):
             rows=[x for x in observed if x['platform']==platform]
             if not rows:continue
             latest=sorted(rows,key=lambda x:x.get('published_at') or 0,reverse=True)[:4]
@@ -210,6 +215,17 @@ def youtube_session(configs):
     are readable with it, so one token covers every channel."""
     from youtube_uploader import get_session
     last=None
+    # Current read-only Analytics grants also provide public Data API counters.
+    # Upload credentials may have been revoked independently; they must not hide
+    # every channel's measurements when a working read-only grant is present.
+    import yt_analytics
+    for channel in yt_analytics.channels():
+        try:
+            session=requests.Session()
+            session.headers.update({'Authorization':'Bearer '+yt_analytics.access_token(channel)})
+            session.proxies.update(PROXIES or {})
+            return session
+        except Exception as exc:last=exc
     for cfg in configs.values():
         token=Path(cfg.get('youtube_token','/nonexistent'))
         if token.is_file():
@@ -318,7 +334,7 @@ def api_overview(items,configs,store,now,fetch=None,have=None):
     return values,errors
 
 
-PLATFORM_INTERVAL_HOURS={'vk':3,'dzen':6,'reddit':6,'tiktok':6,'instagram':6}  # signed-in pages read in the browser
+PLATFORM_INTERVAL_HOURS={'vk':3,'dzen':6,'tiktok':6,'instagram':6}  # signed-in pages read in the browser
 PASS_PLATFORMS_MAX=2     # tabs per hourly pass: each site is a heavy single-page app on a 4.9 GB host
 CALM_WAIT_SECONDS=300    # how long a pass waits for memory/disk pressure to drop before leaving its reading to the next hour
 FORCE_AFTER_SECONDS=6*3600  # a host that never calms down must still be measured now and then
@@ -456,7 +472,7 @@ def _tick(configs,pre=None):
         # Platforms that waited for their turn (or failed) keep their last reading, marked stale.
         carry_over(previous.get('items',[]),metrics,now,only=tuple(PLATFORM_INTERVAL_HOURS))
     else:
-        # Keep the last browser-only readings (VK, Dzen, Reddit, ...) visible but marked old.
+        # Keep the last browser-only readings (VK, Dzen, ...) visible but marked old.
         carry_over(previous.get('items',[]),metrics,now)
     for url in list(metrics):
         extra=latest_overview(overview,url)
@@ -486,7 +502,7 @@ def _tick(configs,pre=None):
     save(cohorts,history)
     brands=analyze(list(history.values()),items)
     feedback={'updated_at':now,'brands':brands,'channels':channels,
-        'coverage':{p:sum(1 for x in items if x['platform']==p and any(x.get('metrics',{}).get(k) is not None for k in ('views','impressions','read_completions','score','comments'))) for p in ('telegram','youtube','vk','dzen','reddit','instagram','tiktok')},'errors':errors}
+        'coverage':{p:sum(1 for x in items if x['platform']==p and any(x.get('metrics',{}).get(k) is not None for k in ('views','impressions','read_completions','score','comments'))) for p in ('telegram','youtube','vk','dzen','instagram','tiktok')},'errors':errors}
     save(DATA/'content_feedback.json',feedback)
     save(folder/'feedback.json',feedback)
     try:

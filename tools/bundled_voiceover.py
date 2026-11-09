@@ -100,7 +100,14 @@ def _prepare(script,run_dir,run_id):
     from browser_process import run as run_browser
     result=run_browser(['docker','exec','video_factory_auth','python3','-u','/app/scripts/vids_voiceover.py',
         voice_id,script['voiceover_ru'],voice],capture_output=True,text=True,timeout=900)
-    if result.returncode:raise RuntimeError('Vids voiceover retained for retry: '+result.stderr[-700:])
+    if result.returncode:
+        receipt_path=BASE_DIR/'output'/f'vids_voice_{voice_id}.json'
+        failed=json.loads(receipt_path.read_text()) if receipt_path.exists() else {}
+        if (failed.get('script')==script['voiceover_ru'] and failed.get('voice')==voice
+                and failed.get('failure_kind')=='voiceover_not_inserted'
+                and failed.get('terminal_failure_observed') and failed.get('reconciliation_observations')):
+            raise NarrationNeedsReview('Vids did not insert audio after bounded, observed recovery; source retained for review')
+        raise RuntimeError('Vids voiceover retained for retry: '+result.stderr[-700:])
     receipt=json.loads(result.stdout.strip().splitlines()[-1])
     source=BASE_DIR/'output'/Path(receipt['file']).relative_to('/data/output')
     if receipt['status']!='completed' or hashlib.sha256(source.read_bytes()).hexdigest()!=receipt['sha256']:

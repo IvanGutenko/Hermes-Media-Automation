@@ -38,10 +38,15 @@ def save(path,state):
 
 
 def geometry(path):
-    out=subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=width,height:format=duration',
+    out=subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=width,height:format=format_name,duration',
         '-of','json',str(path)],text=True,timeout=30)
     data=json.loads(out)
-    return int(data['streams'][0]['width']),int(data['streams'][0]['height']),float(data['format']['duration'])
+    duration=data['format'].get('duration')
+    if duration is None:
+        if data['format'].get('format_name') not in ('png_pipe','jpeg_pipe','webp_pipe','image2'):
+            raise RuntimeError('Video duration unavailable in ffprobe metadata')
+        duration=0  # Still images have dimensions but no playback duration.
+    return int(data['streams'][0]['width']),int(data['streams'][0]['height']),float(duration)
 
 
 async def snap(page,tag):
@@ -53,6 +58,14 @@ async def snap(page,tag):
 
 
 SWITCH_ACCOUNTS=re.compile(r'^(Switch accounts|Сменить аккаунт|Переключить аккаунты)$')
+
+
+async def dismiss_notification_prompt(page):
+    """The opt-in modal covers Settings and Create even though both remain visible."""
+    notice=page.get_by_text(re.compile(r'^(Turn on Notifications|Включите уведомления|Включить уведомления)$'),exact=True).first
+    if await notice.count() and await notice.is_visible():
+        await page.get_by_role('button',name=re.compile(r'^(Not Now|Не сейчас)$'),exact=True).click(timeout=10000)
+        await expect(notice).not_to_be_visible(timeout=10000)
 
 
 async def saved_profile_login(page,username):
@@ -83,17 +96,31 @@ async def switch_account(page,username):
     listed was never signed in here, which only the owner can fix."""
     await page.goto(SITE+'/',wait_until='domcontentloaded',timeout=60000)
     await page.wait_for_timeout(3000)
+    await dismiss_notification_prompt(page)
     if await page.get_by_text(re.compile(r'^(Log into Instagram|Войти в Instagram)$')).count():
         if await saved_profile_login(page,username):return
         raise NeedsLogin('Instagram is not signed in in the factory browser; the owner must log in once')
-    await page.locator('svg[aria-label="Settings"]').first.click(timeout=30000)
-    await page.get_by_text(SWITCH_ACCOUNTS).first.click(timeout=15000)
-    row=page.get_by_role('dialog').last.get_by_text(re.compile('^'+re.escape(username)+'$')).first
-    try:await row.wait_for(timeout=15000)
+    # The desktop home page exposes a direct Switch control beside the current
+    # profile. Settings can contain a hidden responsive duplicate or a different
+    # menu, so prefer the observed direct account chooser.
+    direct=page.get_by_text(re.compile(r'^(Switch|Переключиться)$')).filter(visible=True).first
+    if await direct.count() and await direct.is_visible():
+        await direct.click(timeout=15000)
+    else:
+        await page.locator('svg[aria-label="Settings"]:visible').first.click(timeout=30000)
+        await page.get_by_text(SWITCH_ACCOUNTS).filter(visible=True).first.click(timeout=15000)
+    chooser=page.get_by_text(SWITCH_ACCOUNTS).filter(visible=True).first
+    await chooser.wait_for(state='visible',timeout=15000)
+    # Current Instagram renders the chooser without role=dialog. Require an
+    # open chooser plus a unique visible exact username, then verify ownership
+    # on the requested profile in ensure_signed_in below.
+    row=page.get_by_text(re.compile('^'+re.escape(username)+'$')).filter(visible=True)
+    try:await row.first.wait_for(state='visible',timeout=15000)
     except PlaywrightTimeout:
-        raise NeedsLogin('Instagram account %s is not signed in in the factory browser; the owner must log in once (Switch accounts)'%username) from None
+        raise NeedsLogin('Instagram saved account %s is not visible in the open chooser'%username) from None
+    if await row.count()!=1:raise RuntimeError('Instagram account selection is ambiguous')
     await row.click()
-    await expect(page.get_by_role('dialog')).to_have_count(0,timeout=30000)
+    await expect(chooser).not_to_be_visible(timeout=30000)
     await page.wait_for_timeout(1500)
 
 
@@ -109,7 +136,9 @@ async def ensure_signed_in(page,username):
             # Somebody else's profile has no edit link: another signed-in account is the active one.
             if attempt:raise RuntimeError('Instagram profile page did not show the signed-in account controls') from None
             await switch_account(page,username);continue
-        if await own.count() and await own.is_visible():return
+        if await own.count() and await own.is_visible():
+            await dismiss_notification_prompt(page)
+            return
         if (await login.count() and await login.is_visible()) or (await prompt.count() and await prompt.is_visible()):
             if attempt==0 and await saved_profile_login(page,username):continue
             raise NeedsLogin('Instagram is not signed in in the factory browser; the owner must log in once')
@@ -345,6 +374,13 @@ async def publish(job_path,read_only=False,dry_run=False):
             try:
                 context=browser.contexts[0]
                 page=await context.new_page()
+                network_events=[]
+                def record_response(response):
+                    url=response.url.split('?',1)[0]
+                    if len(network_events)<40 and ('/rupload_' in url or response.status>=400):
+                        network_events.append({'url':url,'status':response.status,'method':response.request.method})
+                page.on('response',record_response)
+                await page.bring_to_front()
                 await ensure_signed_in(page,username)
                 if state['status']=='share_failed_visible' and not state.get('url'):
                     # Instagram said it failed; resubmit only if the profile really has no such post.
@@ -373,6 +409,7 @@ async def publish(job_path,read_only=False,dry_run=False):
                         state['visible_error_context']=(await page.locator('body').inner_text())[-2000:]
                         await page.screenshot(path=str(ROOT/'instagram_last_error.png'),timeout=5000)
                     except Exception:pass
+                state['upload_network_events']=locals().get('network_events',[])
                 state.update(last_error=type(exc).__name__+': '+str(exc)[:500],readback_attempted_at=time.time())
                 save(path,state)
                 raise

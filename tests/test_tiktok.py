@@ -44,6 +44,30 @@ class AccountSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):await self.t.close_account_context(context,'two')
         context.close.assert_awaited_once()
 
+    def _page(self,*hrefs_by_poll):
+        page=MagicMock();page.goto=AsyncMock();page.bring_to_front=AsyncMock();page.wait_for_timeout=AsyncMock()
+        page.locator.return_value.evaluate_all=AsyncMock(side_effect=list(hrefs_by_poll))
+        return page
+
+    async def test_a_studio_list_that_draws_slowly_is_waited_for(self):
+        page=self._page([],[],['/@me/video/7300000000000000001'])
+        self.assertEqual(await self.t.studio_ids(page,'me'),['7300000000000000001'])
+        page.bring_to_front.assert_awaited()
+
+    async def test_a_studio_list_that_stays_empty_gives_up_with_nothing(self):
+        page=self._page(*[[] for _ in range(self.t.STUDIO_POLLS)])
+        self.assertEqual(await self.t.studio_ids(page,'me'),[])
+
+    async def test_a_post_missing_from_a_broken_public_grid_is_found_in_studio_and_nothing_is_resent(self):
+        state={'username':'me','codes_before':['7300000000000000001'],'caption':'c'}
+        url='https://www.tiktok.com/@me/video/7300000000000000002'
+        with patch.object(self.t,'grid_ids',new=AsyncMock(return_value=[])),\
+                patch.object(self.t,'studio_ids',new=AsyncMock(return_value=['7300000000000000002','7300000000000000001'])),\
+                patch.object(self.t,'verify_id',new=AsyncMock(return_value=url)) as verify,patch.object(self.t,'compose',new=AsyncMock()) as compose:
+            await self.t.locate_and_verify(MagicMock(),MagicMock(),state,None)
+        self.assertEqual(state['code'],'7300000000000000002');self.assertEqual(state['url'],url)
+        self.assertEqual(verify.await_count,1);compose.assert_not_awaited()
+
     def test_only_tiktok_data_leaves_the_browser_profile(self):
         import tiktok_session as session
         state={'cookies':[{'name':'a','domain':'.tiktok.com'},{'name':'b','domain':'www.tiktok.com'},{'name':'c','domain':'.google.com'},

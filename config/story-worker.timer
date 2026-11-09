@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the StoryWobble schedule every fifteen minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitInactiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

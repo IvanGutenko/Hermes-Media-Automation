@@ -3,9 +3,13 @@
 import json
 import time
 from pathlib import Path
-from migratoria_editor import db, llm, BASE_DIR, valid_fact_quotes
+from migratoria_editor import db, llm as editor_llm, BASE_DIR, valid_fact_quotes
 from youtube_uploader import save
 from editorial_policy import allowed, EDITORIAL_SCOPE
+
+
+def llm(system,source,review=False):
+    return editor_llm(system,source,review=review,platform='dzen',kind='article')
 
 
 def prepare_article(post_id=None):
@@ -36,6 +40,8 @@ Each material factual claim needs a supporting evidence quotation. Do not confus
             folder.mkdir(parents=True,exist_ok=True)
             result.update(status='draft_ready',source_post_id=row['id'],target_channel='6a6f8db6fad4763cdb24fba1',review=review,created_at=time.time())
             save(folder/'article.json',result);(folder/'article.md').write_text(text)
+            from growth_actions import record
+            record('migratoria','article_draft',result.get('_growth_actions',{}),source_id='migration-post-'+str(row['id']))
             print('Dzen draft saved:',folder,flush=True);return folder
     return None
 

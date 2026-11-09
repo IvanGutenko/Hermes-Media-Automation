@@ -43,7 +43,7 @@ class Page:
 
 @unittest.skipIf(mm is None, 'needs the browser container')
 class PassTests(unittest.TestCase):
-    def run_pass(self, reading, platforms=('vk', 'dzen', 'reddit'), job_extra=None, readers=None):
+    def run_pass(self, reading, platforms=('vk', 'dzen', 'tiktok'), job_extra=None, readers=None):
         log, opened = [], []
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -62,6 +62,7 @@ class PassTests(unittest.TestCase):
             Browser.contexts[0].new_page = new_page
 
             async def connect(_):
+                log.append(('connect',))
                 return Browser()
 
             class Playwright:
@@ -90,10 +91,16 @@ class PassTests(unittest.TestCase):
         self.assertEqual(result['ran'], ['vk'])
 
     def test_platforms_are_read_in_the_fixed_order_and_only_the_requested_ones(self):
-        result, log, opened = self.run_pass(CALM, platforms=('reddit', 'vk'))
-        self.assertEqual([e[1] for e in log if e[0] == 'read'], ['vk', 'reddit'])
+        result, log, opened = self.run_pass(CALM, platforms=('tiktok', 'reddit', 'vk'))
+        self.assertEqual([e[1] for e in log if e[0] == 'read'], ['vk', 'tiktok'])
         self.assertEqual(len(opened), 2)
         self.assertEqual(result['skipped'], [])
+
+    def test_a_stale_reddit_only_job_does_not_connect_to_the_browser(self):
+        result,log,opened=self.run_pass(CALM,platforms=('reddit',))
+        self.assertNotIn(('connect',),log)
+        self.assertEqual(opened,[])
+        self.assertEqual(result['ran'],[])
 
     def test_a_busy_host_opens_no_tab_and_the_platforms_wait_for_the_next_pass(self):
         result, log, opened = self.run_pass({**CALM, 'io_pressure': 92.0})

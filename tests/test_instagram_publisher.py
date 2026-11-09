@@ -15,7 +15,7 @@ class FakePlaywright:
 
 def fake_browser():
     page=MagicMock();page.close=AsyncMock();page.locator.return_value.inner_text=AsyncMock(return_value='visible text')
-    page.screenshot=AsyncMock();page.goto=AsyncMock()
+    page.screenshot=AsyncMock();page.goto=AsyncMock();page.bring_to_front=AsyncMock()
     context=MagicMock();context.new_page=AsyncMock(return_value=page)
     browser=MagicMock();browser.contexts=[context];browser.close=AsyncMock()
     return browser
@@ -228,11 +228,14 @@ class Fake:
     first=property(lambda self:self)
     last=property(lambda self:self)
     def or_(self,other):return self
+    def filter(self,**kwargs):return self
     async def wait_for(self,timeout=None,state=None):
         if self.times_out:raise ig.PlaywrightTimeout('timeout')
     async def count(self):return 1 if self.visible else 0
     async def is_visible(self):return self.visible
-    async def click(self,timeout=None):self.clicks+=1
+    async def click(self,timeout=None):
+        self.clicks+=1
+        if self.click_hook:self.click_hook()
     def get_by_text(self,pattern):return self.row
     def get_by_role(self,role,name=None):return self
 
@@ -242,7 +245,9 @@ class AccountPage:
     def __init__(self,active,listed=True):
         self.active,self.listed,self.gotos,self.switched=active,listed,[],[]
         self.login=Fake()
-        self.row=Fake(times_out=not listed)
+        self.chooser=Fake()
+        def select():self.active=True;self.chooser.visible=False
+        self.row=Fake(visible=listed,times_out=not listed,click=select)
     def goto(self,url,**kw):
         async def go():self.gotos.append(url)
         return go()
@@ -254,7 +259,14 @@ class AccountPage:
         if role=='dialog':
             dialog=Fake();dialog.row=self.row;return dialog
         return Fake()
-    def get_by_text(self,pattern):return Fake()
+    def get_by_text(self,pattern,**kwargs):
+        if pattern.search('Turn on Notifications') or pattern.search('Log into Instagram'):return Fake()
+        if pattern.search('Switch accounts'):return self.chooser
+        if pattern.search('Switch'):
+            def open_chooser():self.chooser.visible=True
+            return Fake(visible=True,click=open_chooser)
+        if pattern.search('wrongdevp'):return self.row
+        return Fake()
     async def wait_for_timeout(self,ms):pass
 
 
@@ -286,9 +298,10 @@ class SignInTests(unittest.TestCase):
 
     def test_switching_clicks_the_wanted_account_and_waits_for_the_dialog_to_close(self):
         page=AccountPage(active=False)
-        closed=MagicMock();closed.to_have_count=AsyncMock()
+        closed=MagicMock();closed.not_to_be_visible=AsyncMock()
         with patch.object(ig,'expect',return_value=closed):asyncio.run(ig.switch_account(page,'wrongdevp'))
-        self.assertEqual(page.row.clicks,1);closed.to_have_count.assert_awaited_once()
+        self.assertEqual(page.row.clicks,1);closed.not_to_be_visible.assert_awaited_once()
+        self.assertFalse(page.chooser.visible)
 
     def test_an_account_that_was_never_signed_in_here_needs_the_owner(self):
         page=AccountPage(active=False,listed=False)

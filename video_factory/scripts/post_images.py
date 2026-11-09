@@ -10,11 +10,29 @@ import time
 from pathlib import Path
 from script_generator import BASE_DIR
 from youtube_uploader import save
-from browser_process import run as run_browser
 
 
 def image_key(brand,source_id):
     return hashlib.sha256((brand+':'+source_id).encode()).hexdigest()
+
+
+def request_attempts(folder,account):
+    """One original request, plus one preserved recovery for a proven discarded result."""
+    original=folder/('pics'+str(account))
+    yield original
+    receipt=original/'pics_receipt.json';preview=original/'export_ui.json'
+    state=json.loads(receipt.read_text()) if receipt.exists() else {}
+    if (state.get('status')=='empty_document_after_submission' and state.get('empty_observed_at')
+            and state.get('empty_evidence_sha256') and (original/'empty_recovery_ui.json').exists()):
+        evidence=json.loads((original/'empty_recovery_ui.json').read_text())
+        if (hashlib.sha256(evidence.get('snapshot','').encode()).hexdigest()==state['empty_evidence_sha256']
+                and evidence.get('url')==state.get('document_url')
+                and 'heading "Drop or select an image to start editing"' in evidence.get('snapshot','')):
+            yield folder/('pics'+str(account)+'_recovery1')
+    elif (state.get('status')=='result_lost_before_confirmation' and state.get('result_loss_observed_at')
+            and state.get('result_loss_evidence') and preview.exists()
+            and 'radiogroup "Image previews"' in json.loads(preview.read_text()).get('snapshot','')):
+        yield folder/('pics'+str(account)+'_recovery1')
 
 
 def ensure_image(brand,source_id,title,text):
@@ -46,22 +64,36 @@ Avoid readable text and exact logos. No personal testimony. Do not introduce new
             # browser. Fail over only on an explicit quota/account rejection.
             source=json.loads(job.read_text());proof=None
             for account in (0,1):
-                attempt=folder/('pics'+str(account));attempt.mkdir(exist_ok=True)
-                request=attempt/'job.json';receipt=attempt/'pics_receipt.json'
-                if not request.exists():save(request,{**source,'account_index':account})
-                state=json.loads(receipt.read_text()) if receipt.exists() else {}
-                if state.get('status')=='provider_unavailable':
-                    if time.time()<state.get('retry_after',0):continue
-                    state.update(status='document_created' if state.get('document_url') else 'new')
-                    state.pop('submitted_at',None);state.pop('failure_kind',None);save(receipt,state)
-                result=run_browser(['docker','exec','video_factory_auth','python3','-u','/app/scripts/post_image_generator.py',
-                    '/data/output/'+str(request.relative_to(BASE_DIR/'output'))],capture_output=True,text=True,timeout=420)
-                state=json.loads(receipt.read_text()) if receipt.exists() else {}
-                if result.returncode:
-                    if state.get('status')=='provider_unavailable':continue
-                    raise RuntimeError('Post image retained on the same account for retry: '+result.stderr[-700:])
-                proof=state
-                shutil.copyfile(attempt/'image.jpg',image);save(chosen,proof);break
+                for attempt in request_attempts(folder,account):
+                    attempt.mkdir(exist_ok=True)
+                    request=attempt/'job.json';receipt=attempt/'pics_receipt.json'
+                    if not request.exists():
+                        data={**source,'account_index':account}
+                        if attempt.name.endswith('_recovery1'):
+                            data['recovery_of']=str(folder/('pics'+str(account))/'pics_receipt.json')
+                        save(request,data)
+                    state=json.loads(receipt.read_text()) if receipt.exists() else {}
+                    if state.get('status') in ('result_lost_before_confirmation','empty_document_after_submission'):
+                        if attempt.name.endswith('_recovery1'):raise RuntimeError('Recovered Pics result was lost; manual review required')
+                        continue
+                    if state.get('status')=='provider_unavailable':
+                        if time.time()<state.get('retry_after',0):continue
+                        state.update(status='document_created' if state.get('document_url') else 'new')
+                        state.pop('submitted_at',None);state.pop('failure_kind',None);save(receipt,state)
+                    # Queue behind the other Chrome workers, preserving this request.
+                    from content_distribution import run_publisher
+                    result=run_publisher(['docker','exec','video_factory_auth','python3','-u','/app/scripts/post_image_generator.py',
+                        '/data/output/'+str(request.relative_to(BASE_DIR/'output'))],capture_output=True,text=True,timeout=420)
+                    state=json.loads(receipt.read_text()) if receipt.exists() else {}
+                    if result.returncode:
+                        if state.get('status') in ('result_lost_before_confirmation','empty_document_after_submission'):
+                            if attempt.name.endswith('_recovery1'):raise RuntimeError('Recovered Pics result was lost; manual review required')
+                            continue
+                        if state.get('status')=='provider_unavailable':continue
+                        raise RuntimeError('Post image retained on the same account for retry: '+result.stderr[-700:])
+                    proof=state
+                    shutil.copyfile(attempt/'image.jpg',image);save(chosen,proof);break
+                if proof:break
             if not proof:raise RuntimeError('Google Pics is unavailable on both saved accounts; post retained for retry')
         if proof.get('status')!='completed' or not image.exists() or hashlib.sha256(image.read_bytes()).hexdigest()!=proof.get('sha256'):
             raise RuntimeError('Post image has no matching generation receipt')

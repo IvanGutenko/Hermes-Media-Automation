@@ -1,0 +1,21 @@
+[Unit]
+Description=StoryWobble: make the next reviewed story and publish it on schedule
+After=network-online.target hermes-vpn.service
+Wants=hermes-vpn.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/gut/hermes-workspace/video_factory
+Environment=PYTHONPATH=/home/gut/hermes-workspace/video_factory/scripts
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=LVL_TTS_PROXY=http://127.0.0.1:17890
+# One story a day: the stronger Antigravity model writes it first (a slow answer is skipped after 290 s).
+Environment=MEDIA_TEXT_LLM_ORDER=agy,openrouter,groq
+# Text-model and media-review keys live in the Hermes environment file.
+EnvironmentFile=%h/.hermes/.env
+ExecStart=/home/gut/hermes-workspace/tg_autoposter/.venv/bin/python -u /home/gut/hermes-workspace/video_factory/scripts/story_worker.py
+TimeoutStartSec=3300
+Nice=15
+CPUWeight=40
+UMask=0022

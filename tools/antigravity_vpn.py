@@ -90,7 +90,7 @@ def candidates(controller, state, exclude=()):
         if p_info.get('vehicleType') in ('File', 'HTTP'):
             nodes.extend([p for p in p_info.get('proxies', []) if p['name'] not in exclude])
     preferred = ('Германия - 6', 'Германия - 5', 'ChatGPT, Gemini, AI', 'Финляндия - 1',
-                 'Тайник VPN Германия', 'Германия - 8', 'Германия - 3', 'Германия - 4',
+                 'Германия - 8', 'Германия - 3', 'Германия - 4',
                  'Нидерланды - 1', 'Нидерланды - 2', 'Франция - 1', 'Основной сервер - 4')
     def order(node):
         previous = state['nodes'].get(node['name'], {})

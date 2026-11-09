@@ -34,6 +34,22 @@ class ProviderPoolTests(unittest.TestCase):
         (self.out/f'{provider}_{rid}.json').write_text(json.dumps(d))
         return type('Result',(),{'stderr':'','returncode':0})()
 
+    def test_all_observed_holds_preserve_the_scene_and_retry_when_the_first_provider_can_recover(self):
+        now=pool.time.time()
+        pool.holds(('f',{'reason':'quota_exhausted','retry_after':now+3600}))
+        pool.holds(('v',{'reason':'feature_unavailable','retry_after':now+7200}))
+        with patch.object(pool,'run_browser') as run:
+            with self.assertRaises(pool.IncludedProvidersUnavailable) as caught:
+                pool.generate_video_file(self.prompt,'Title','waiting',providers=self.providers)
+        run.assert_not_called()
+        self.assertEqual(caught.exception.retry_after,now+3600)
+        self.assertIn('f=quota_exhausted',str(caught.exception))
+        self.assertIn('v=feature_unavailable',str(caught.exception))
+        state=json.loads((self.out/'generation_routes/waiting.json').read_text())
+        self.assertEqual(state['status'],'waiting_for_included_provider')
+        self.assertEqual(state['attempts'],[])
+        self.assertEqual(state['retry_after'],now+3600)
+
     def test_terminal_credit_refusal_falls_back_and_completed_scene_is_idempotent(self):
         with patch.object(pool.subprocess,'run',side_effect=self.receipt) as call:
             first=pool.generate_video_file(self.prompt,'Title','case',providers=self.providers)

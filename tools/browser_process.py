@@ -1,5 +1,6 @@
 """Bound the container worker itself, not only the docker client waiting for it, and share the one browser fairly."""
 import fcntl
+from contextlib import contextmanager
 import os
 import subprocess
 import time
@@ -34,6 +35,22 @@ def publisher_waiting(base=None,now=None):
     """True while a publisher wants the browser: generation then does not start its next scene."""
     try:return (now or time.time())-waiting_marker(base).stat().st_mtime<WAITING_FRESH_SECONDS
     except OSError:return False
+
+
+@contextmanager
+def render_lease(base=None):
+    """Keep the LVL encoder's memory/disk burst out of active browser operations."""
+    lease_file(base).parent.mkdir(parents=True,exist_ok=True)
+    # Give an already waiting publisher one grace window, then join the
+    # kernel's lock queue. A continuously refreshed marker used to starve a
+    # completed scene indefinitely behind recurring image/browser tasks.
+    deadline=time.monotonic()+WAITING_FRESH_SECONDS
+    while publisher_waiting(base) and time.monotonic()<deadline:
+        time.sleep(2)
+    fd=os.open(lease_file(base),os.O_RDONLY|os.O_CREAT,0o644)
+    with os.fdopen(fd) as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        yield
 
 
 def wait_for_lease(max_wait,base=None,poll=5):

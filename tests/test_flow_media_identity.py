@@ -38,6 +38,17 @@ class MediaIdentityTests(unittest.TestCase):
 
 
 class MetadataDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_credit_warning_image_is_a_terminal_quota_refusal_before_submission(self):
+        page=Mock();page.locator.return_value.is_visible=AsyncMock(return_value=False)
+        def control(role,**kw):
+            result=Mock();result.is_visible=AsyncMock(return_value=kw.get('name')=='Insufficient credits warning')
+            return result
+        page.get_by_role.side_effect=control
+        with self.assertRaises(flow.ProviderUnavailable) as error:
+            await flow.configure_video(page)
+        self.assertEqual(error.exception.kind,'quota_exhausted')
+        page.keyboard.press.assert_not_called()
+
     async def test_entry_wait_uses_visible_controls_without_evaluating_script(self):
         page=Mock();page.url='https://flow.google.com/u/1/'
         page.get_by_role.return_value.is_visible=AsyncMock(return_value=True)
@@ -162,6 +173,14 @@ class MetadataDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(flow.request_is_lost('my prompt', submitted, now=submitted + 99999))
         flow.MEDIA_INFO.clear()
         self.assertFalse(flow.request_is_lost('my prompt', submitted, now=submitted + 99999))
+
+    async def test_a_hanging_editor_cannot_undo_a_finished_clip(self):
+        page = Mock()
+        done = page.get_by_role.return_value
+        done.is_visible = AsyncMock(return_value=True)
+        done.click = AsyncMock(side_effect=TimeoutError('waiting for scheduled navigations to finish'))
+        await flow.leave_editor(page)
+        done.click.assert_awaited_once_with(no_wait_after=True)
 
     def _metadata_page(self, batches):
         """Each reload delivers its list of bodies through the page's response listener."""

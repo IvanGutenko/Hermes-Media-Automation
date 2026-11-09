@@ -121,6 +121,8 @@ def blink(t, phase):
 
 def draw_actor(canvas, actor, t, since, line_mouth, line_active):
     cx, size = SIDES.get(actor.get('side', 'center'), SIDES['center'])
+    inset=actor.get('_footage_inset',False)
+    if inset:size=int(size*.42)
     appear = lvl_scene.pop_scale(min(1.0, since / 0.28 + 0.0001))
     dx, dy, squash, tilt, al, ar = action_motion(actor.get('action', 'none'), t, since)
     speaking = actor.get('speaking') and line_active
@@ -129,7 +131,14 @@ def draw_actor(canvas, actor, t, since, line_mouth, line_active):
         'xp': actor.get('xp', 0.6), 'level': actor.get('level', 1)}
     if speaking:pose['look'] = (0, 0)
     im = sprite(actor['spec'], pose, size)
-    paste_center(canvas, im, cx + dx, CHAR_Y + dy + (0 if actor.get('side', 'center') == 'center' else 90), appear)
+    paste_center(canvas, im, cx + dx*(.42 if inset else 1), (1220 if inset else CHAR_Y) + dy*(.42 if inset else 1) + (0 if inset or actor.get('side', 'center') == 'center' else 90), appear)
+
+
+@lru_cache(maxsize=1)
+def footage_scrim():
+    strip=Image.new('RGBA',(1,H))
+    strip.putdata([(12,10,28,int(max(0,1-y/370)*165+max(0,min(1,(y-1190)/310))*190)) for y in range(H)])
+    return strip.resize((W,H))
 
 
 def props_layer(canvas, props, t):
@@ -298,16 +307,19 @@ def render_frame(scenes, starts, total, t, ctx):
         local_t = local if idx is not None else (t - starts[0] if t >= starts[0] else 0.0)
     else:
         show = scenes[idx];local_t = local
-    canvas = background(show['setting'], show.get('seed', 0)).copy()
-    if idx is not None and local < 0.2 and idx > 0:
+    footage=ctx['footage'].frame(idx,local) if ctx.get('footage') else None
+    canvas = footage if footage is not None else background(show['setting'], show.get('seed', 0)).copy()
+    if footage is not None:canvas.alpha_composite(footage_scrim())
+    if footage is None and idx is not None and local < 0.2 and idx > 0:
         prev = background(scenes[idx - 1]['setting'], scenes[idx - 1].get('seed', 0))
         canvas = Image.blend(prev, canvas, local / 0.2)
     line_active = idx is not None
     mouth = mouth_at(show, local_t) if line_active else 0.0
     if not outro:  # the end card brings its own hero; the last scene's cast must not ghost behind it
-        props_layer(canvas, show.get('props', []), local_t if idx is not None else 99)
+        if footage is None:props_layer(canvas, show.get('props', []), local_t if idx is not None else 99)
         for actor in show['actors']:
             a = dict(actor)
+            if footage is not None:a['_footage_inset']=True
             a['xp'] = ctx['xp_at'](t);a['level'] = ctx['level_at'](t)
             draw_actor(canvas, a, t, local_t if idx is not None else 5.0, mouth, line_active)
     if show.get('popup') and idx is not None:
@@ -359,6 +371,8 @@ def render(scenes, out_path, work_dir, title, subtitle=None, end_lines=('Subscri
     xp_at, level_at = make_progress(scenes, starts, total, level, xp_start)
     ctx = {'xp_at': xp_at, 'level_at': level_at, 'name': name, 'title_text': title, 'subtitle': subtitle, 'end_lines': list(end_lines),
         'hero_spec': hero_spec or scenes[0]['actors'][0]['spec']}
+    from lvl_hybrid import Frames
+    footage=Frames(scenes);ctx['footage']=footage
     pcm = build_audio(scenes, starts, total, music[0], music[1], sfx_plan(scenes, starts))
     wav = lvl_voice.write_wav(work_dir / 'mix.wav', pcm)
     frames = int(total * FPS)
@@ -381,4 +395,7 @@ def render(scenes, out_path, work_dir, title, subtitle=None, end_lines=('Subscri
     except BaseException:
         proc.kill()
         raise
+    finally:
+        footage.close()
+        proc.stderr.close()
     return {'duration': total, 'frames': frames, 'seconds': round(time.time() - started, 1)}

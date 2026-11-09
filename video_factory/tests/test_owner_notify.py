@@ -127,10 +127,10 @@ class PlatformReportTests(unittest.TestCase):
     def test_a_failure_names_brand_and_platform_hides_secrets_and_repeats_at_most_every_six_hours(self):
         with patch.object(o, 'send') as send:
             o.failure('lvl', 'telegram', 'Traceback (most recent call last):\n  File "x.py", line 3\nRuntimeError: bad '
-                      'https://api.telegram.org/bot9236501010:AAFXIoz_lkIYTIp1kQPRr2vtgZSaIISgegY/sendVideo failed')
+                      'https://api.telegram.org/bot1234567890:AAexampleTokenOnlyForTheRedactionTest00/sendVideo failed')
         text = send.call_args.args[0]
         self.assertIn('LVL', text);self.assertIn('Telegram', text)
-        self.assertNotIn('AAFXIoz', text);self.assertNotIn('9236501010', text)
+        self.assertNotIn('AAexampleToken', text);self.assertNotIn('1234567890', text)
         self.assertEqual(send.call_args.kwargs, {'key': 'fail:lvl:telegram', 'cooldown': 6 * 3600})
 
     def test_a_lost_login_is_called_a_login_problem(self):

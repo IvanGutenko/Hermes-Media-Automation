@@ -177,7 +177,7 @@ def ass_text(text):
     return text.replace('\\', '').replace('{', '').replace('}', '').replace('\n', ' ')
 
 
-def scene_subtitles(scene, duration, path):
+def scene_subtitles(scene, duration, path, show_label=True):
     header = '''[Script Info]
 ScriptType: v4.00+
 PlayResX: 720
@@ -190,11 +190,13 @@ Style: Speech,Liberation Sans,42,&H00FFFFFF,&H000000FF,&H00101010,&H80000000,-1,
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 '''
+    if not show_label:
+        header=header.replace('Speech,Liberation Sans,42,','Speech,Liberation Sans,36,').replace(',2,55,55,260,1',',2,72,100,160,1')
     label=scene['on_screen_text_ru'];detail=scene.get('on_screen_detail_ru')
     # One editorial card at a time. Keep the subject visible and the CTA uncluttered.
     split=min(1.5,duration/2) if detail and '@' not in label else duration
-    events=[f'Dialogue: 0,0:00:00.00,{ass_time(split)},Label,,0,0,0,,{ass_text(label)}']
-    if split<duration:
+    events=[f'Dialogue: 0,0:00:00.00,{ass_time(split)},Label,,0,0,0,,{ass_text(label)}'] if show_label else []
+    if show_label and split<duration:
         events.append(f'Dialogue: 0,{ass_time(split)},{ass_time(duration)},Label,,0,0,0,,{ass_text(detail)}')
     timed=scene.get('_speech_words')
     if timed:
@@ -251,6 +253,7 @@ def run_pipeline(custom_topic=None, post_id=None, script_json=None, publish=Fals
                     'voice': RUSSIAN_VOICE, 'tts_model': TTS_MODEL,
                     'publish_requested': publish, 'scenes': [], 'brand': os.getenv('MEDIA_BRAND', 'wrongdev')}
     manifest['audio_mode']=audio_mode
+    # A saved legacy job keeps its original shots; only new directed scripts use motion.
     if audio_mode=='native':manifest.update(voice='Veo native ru-RU',tts_model=None)
     if audio_mode=='vids':manifest.update(voice='Google Vids ru-RU',tts_model='Included Google Vids voiceover')
     manifest_path = run_dir / 'manifest.json'
@@ -271,6 +274,11 @@ def run_pipeline(custom_topic=None, post_id=None, script_json=None, publish=Fals
                 script = generate_shorts_script(topic['text'], run_dir)
             manifest['source_sha256'] = script.get('source_sha256')
             manifest['title'] = script['youtube_meta']['title']
+            manifest['visual_mode'] = script.get('visual_mode', 'generated')
+            if manifest['visual_mode']=='hybrid':
+                manifest['motion_system']=script.get('motion_system','html-gsap-v1')
+            if manifest['visual_mode']=='hybrid' and audio_mode=='native':
+                raise ValueError('Hybrid motion needs separate Russian narration (vids or gemini)')
             from script_review import audit,require_pass as require_script_pass
             script_review=audit(script,run_dir)
             require_script_pass(script_review)
@@ -304,9 +312,12 @@ def run_pipeline(custom_topic=None, post_id=None, script_json=None, publish=Fals
                 manifest['status'] = f'generating_scene_{index}'
                 write_json(manifest_path, manifest)
                 asset_run=f'{run_id}_native_s{index}' if audio_mode=='native' else f'{run_id}_s{index}'
-                from video_provider_pool import generate_video_file
-                raw, receipt = generate_video_file(scene['video_prompt_en'], manifest['title'], asset_run,
-                    resume=bool(resume),voiceover_ru=scene['voiceover_ru'] if audio_mode=='native' else None)
+                kind=scene.get('visual_type','video') if script.get('visual_mode')=='hybrid' else 'video'
+                raw=None;receipt={};motion_receipt=None
+                if kind!='motion':
+                    from video_provider_pool import generate_video_file
+                    raw, receipt = generate_video_file(scene['video_prompt_en'], manifest['title'], asset_run,
+                        resume=bool(resume),voiceover_ru=scene['voiceover_ru'] if audio_mode=='native' else None)
                 subtitles = run_dir / f'scene_{index:02d}.ass'
                 target = run_dir / f'scene_{index:02d}.mp4'
                 if audio_mode=='native':
@@ -315,11 +326,21 @@ def run_pipeline(custom_topic=None, post_id=None, script_json=None, publish=Fals
                     duration=end-start
                     scene_subtitles(scene,duration,subtitles)
                     render(raw,subtitles,start,end,target)
+                elif kind in ('motion','hybrid'):
+                    scene_subtitles(scene,duration,subtitles,show_label=False)
+                    from motion_design import render as render_motion
+                    motion_receipt=render_motion(scene,audio,subtitles,duration,target,
+                        palette=script['motion_palette'],raw=raw,
+                        system=script.get('motion_system','html-gsap-v1'))
                 else:
                     scene_subtitles(scene, duration, subtitles)
                     render_scene(raw, audio, subtitles, duration, target)
-                manifest['scenes'].append({'id': index, 'raw_video': str(raw), 'media_id': receipt['media_id'],
-                    'sha256': receipt['sha256'], 'duration': duration, 'rendered_video': str(target),
+                digest=hashlib.sha256(target.read_bytes()).hexdigest()
+                manifest['scenes'].append({'id': index, 'visual_type':kind,
+                    'raw_video': str(raw) if raw else None,
+                    'media_id': receipt.get('media_id') if raw else 'motion:'+run_id+':'+str(index),
+                    'sha256': receipt['sha256'] if raw else digest,
+                    'motion':motion_receipt, 'duration': duration, 'rendered_video': str(target),
                     'voiceover_ru': scene['voiceover_ru'], 'video_prompt_en': scene['video_prompt_en']})
                 write_json(manifest_path, manifest)
             clips = [Path(s['rendered_video']) for s in manifest['scenes']]

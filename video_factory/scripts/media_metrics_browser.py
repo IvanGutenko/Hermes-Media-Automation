@@ -10,7 +10,7 @@ import host_load
 
 ROOT=Path('/data/output')
 MAX_OVERVIEWS=4  # Studio pages read per brand per run; each takes up to ~25 s
-ORDER=('vk','dzen','reddit','tiktok','instagram')
+ORDER=('vk','dzen','tiktok','instagram')
 # The readers below use text and DOM attributes only. Decoding feed images and autoplaying video was the bulk
 # of each tab's memory (renderers of 270-500 MB measured on 2026-11-01). URL patterns, not Playwright routing:
 # routing switches the HTTP cache off, which would re-download every script bundle on each run.
@@ -161,6 +161,9 @@ async def collect(path):
         reason=None if job.get('force') else host_load.busy()
         if reason:skipped.append(label+': '+reason)
         return reason is None
+    if not job.get('overview_targets') and not any(n in ORDER for n in job.get('platforms',ORDER)):
+        persist('completed')
+        return {'metrics':metrics,'errors':errors,'ran':ran,'skipped':skipped}
     with (ROOT/'.flow-generation.lock').open('a') as lock:
         # Generation can hold the one browser lease for an hour. Wait for a gap instead of failing at once:
         # 101 of 120 runs on 2026-10-31/11-01 died on an immediate non-blocking attempt.
@@ -183,7 +186,7 @@ async def collect(path):
                     except Exception as exc:errors[brand+'/youtube']=type(exc).__name__+': '+str(exc)[-250:]
                     finally:await close_page(page,brand+'/youtube')
                     persist(brand+'/youtube')
-                readers={'vk':(vk,45),'dzen':(dzen,35),'reddit':(reddit,35),'tiktok':(tiktok,60),'instagram':(instagram,60)}
+                readers={'vk':(vk,45),'dzen':(dzen,35),'tiktok':(tiktok,60),'instagram':(instagram,60)}
                 for name in [n for n in ORDER if n in job.get('platforms',ORDER)]:
                     fn,budget=readers[name]
                     if not calm(name):continue

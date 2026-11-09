@@ -176,7 +176,8 @@ def validate_script(data):
     meta['tags'] = [display_text(t) for t in meta['tags']]
     data['video_prompt_en'] = '\n\n'.join(f"[Cut {s['id']}] {s['video_prompt_en']}" for s in scenes)
     data['montage_notes'] = [s['edit_note_ru'] for s in scenes]
-    return data
+    from motion_design import validate_direction
+    return validate_direction(data)
 
 
 def fetch_latest_post():
@@ -279,6 +280,8 @@ def spoken_names_rule():
 def system_prompt(brand):
     """The channel brief; only the WrongDev prompt carries the guide-or-links and spoken-names rules."""
     base = SYSTEM_PROMPT.replace('<<CTA>>', CTA_RULE + spoken_names_rule() if brand['id'] == 'wrongdev' else '')
+    from motion_design import DIRECTOR_PROMPT
+    base += DIRECTOR_PROMPT
     if brand['id'] == 'wrongdev':return base
     return base.replace('https://t.me/WrongDevp', brand['link']).replace('@WrongDevp', brand['name']).replace('developer channel', 'relocation and travel channel') + '\nFor Migratoria focus on a concrete relocation/travel consequence, nationality and effective dates. Do not invent visa advice, costs, personal experience or approval guarantees. Keep verification evidence private; no source footer or watermark.\n'
 
@@ -295,6 +298,10 @@ def save_script(data, output_dir):
                   'На экране: ' + scene['on_screen_text_ru'], '', scene['edit_note_ru'], '']
         if scene.get('on_screen_detail_ru'):
             lines += ['Текст в центре: ' + scene['on_screen_detail_ru'], '']
+        if scene.get('motion'):
+            spec=scene['motion']
+            lines += ['Визуал: '+scene['visual_type']+' / '+spec['layout'],
+                'Моушн: '+spec['headline'], ' → '.join(spec['items']),spec.get('kicker',''),'']
     (output_dir / 'script.md').write_text('\n'.join(lines))
 
 
@@ -302,7 +309,13 @@ def _validated(raw, fields, brand_id, last_try):
     """Validate a model answer; on the last try an unmet arm rule drops the arm instead of the video."""
     from growth_brief import without_param
     while True:
-        try:return validate_script({**json.loads(raw), **fields})
+        try:
+            data={**json.loads(raw), **fields}
+            if data.get('visual_mode')!='hybrid':
+                raise ValueError('New scripts require visual_mode=hybrid and motion direction for every scene')
+            if data.get('motion_system')!='editorial-v2':
+                raise ValueError('New scripts require motion_system=editorial-v2')
+            return validate_script(data)
         except ArmRuleError as exc:
             if not last_try or exc.param not in fields:raise
             print(f'Script left its {exc.param} test arm and is not counted in it: {exc}', flush=True)
@@ -323,9 +336,11 @@ def generate_shorts_script(topic_or_text=None, output_dir=None):
         system = system_prompt(brand)
         from content_feedback import _feedback_brief
         from growth_brief import assign
+        import growth_actions
+        editorial = growth_actions.context(brand['id'])
         # The arm is decided once per video, so the result can be measured later.
         assignment = assign(brand['id'], diagnostics.name) if output_dir else {'prompt': '', 'fields': {}}
-        system += _feedback_brief(brand['id']) + assignment['prompt']
+        system += _feedback_brief(brand['id']) + assignment['prompt'] + editorial['prompt']
         messages = [{'role': 'system', 'content': system+'\n'+EDITORIAL_SCOPE},
                     {'role': 'user', 'content': 'Current date: '+datetime.now(timezone.utc).date().isoformat()+'. Do not describe an older programme as newly opening today. A right to apply before moving is not permanent residence without moving. Preserve net/gross and monthly qualifiers in displayed financial requirements.\nSOURCE:\n' + source[:12000]}]
         for attempt in range(2):
@@ -358,7 +373,10 @@ def generate_shorts_script(topic_or_text=None, output_dir=None):
                     {'role':'user','content':str(exc)+' Correct the full script using only supported source facts and preserve all material conditions.'}]
                 continue
             target = Path(output_dir) if output_dir else OUTPUT_DIR / 'scripts' / data['script_id']
+            data['growth_actions'] = editorial['receipt']
             save_script(data, target)
+            growth_actions.record(brand['id'], 'video_script', editorial['receipt'], run_id=target.name,
+                title=data['youtube_meta']['title'], actions_status='included_in_fact_reviewed_script')
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             (OUTPUT_DIR / 'latest_script.json').write_text((target / 'script.json').read_text())
             (OUTPUT_DIR / 'latest_script.md').write_text((target / 'script.md').read_text())

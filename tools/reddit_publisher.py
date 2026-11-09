@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Own-profile Reddit publication with durable ids and public readback.
+"""Explicit-destination Reddit publication with durable ids and public readback.
 
 A created id is an acknowledgement, not proof of public publication. An uncertain
 submission is reconciled on the same id and blocks replacement submissions.
@@ -17,6 +17,8 @@ from urllib.parse import urlparse, parse_qs
 from playwright.async_api import async_playwright, expect
 from browser_session import connect
 from reddit_format import platform_body
+from platform_policy import DISABLED_PLATFORMS,disabled_result
+from reddit_targets import destination,home,permalink,same,matches_community
 
 ROOT=Path('/data/output')
 
@@ -84,18 +86,20 @@ def matches_uploaded_image(photo,upload):
 
 
 async def discover(context,state):
-    """Locate a manually completed own-profile post without submitting anything."""
+    """Locate a manually completed post in its original destination without submitting anything."""
     page=await context.new_page()
     try:
-        await page.goto('https://old.reddit.com/user/'+state['username']+'/submitted/?sort=new',wait_until='domcontentloaded',timeout=30000)
+        listing=home(state,old=True)+('/new/' if destination(state).startswith('r_') else '/submitted/?sort=new')
+        await page.goto(listing,wait_until='domcontentloaded',timeout=30000)
         posts=page.locator('.thing[data-fullname^="t3_"]')
         for i in range(await posts.count()):
             post=posts.nth(i)
             if not await post.locator('a.title').count():continue
             if await post.locator('a.title').inner_text()!=state['title']:continue
             if (await post.locator('a.author').first.inner_text()).casefold()!=state['username'].casefold():continue
+            if not matches_community(destination(state),await post.get_attribute('data-subreddit')):continue
             identity=(await post.get_attribute('data-fullname')).removeprefix('t3_')
-            state.update(id=identity,url='https://old.reddit.com/user/'+state['username']+'/comments/'+identity+'/',interface='old')
+            state.update(id=identity,url=permalink(state,identity,old=True),interface='old')
             return
         raise RuntimeError('Reviewed post is not present in the own profile; awaiting platform/manual completion')
     finally:await page.close()
@@ -105,9 +109,11 @@ async def readback(context,state):
     page=await context.new_page()
     try:
         if not state.get('media_present') and state.get('interface')=='old':
-            await page.goto('https://old.reddit.com/user/'+state['username']+'/comments/'+state['id']+'/',wait_until='domcontentloaded',timeout=30000)
+            await page.goto(permalink(state,state['id'],old=True),wait_until='domcontentloaded',timeout=30000)
             post=page.locator('.thing[data-fullname="t3_'+state['id']+'"]')
             await post.wait_for(timeout=20000)
+            if not matches_community(destination(state),await post.get_attribute('data-subreddit')):
+                raise RuntimeError('Reddit text post belongs to a different community')
             if (await post.locator('a.author').first.inner_text()).casefold()!=state['username'].casefold():
                 raise RuntimeError('Reddit text post belongs to another author')
             if await post.locator('a.title').inner_text()!=state['title']:
@@ -121,6 +127,9 @@ async def readback(context,state):
         await post.or_(missing).first.wait_for(timeout=20000)
         if await missing.is_visible():raise RuntimeError('Reddit shows Page not found for the saved post id')
         await post.wait_for(timeout=20000)
+        community=await post.get_attribute('subreddit-prefixed-name') or await post.get_attribute('subreddit-name')
+        if not matches_community(destination(state),community):
+            raise RuntimeError('Reddit post belongs to a different community')
         if (await post.get_attribute('author') or '').casefold()!=state['username'].casefold():
             raise RuntimeError('Reddit post owner differs from the approved profile')
         if await post.get_attribute('post-title')=='[ Removed by Reddit ]':
@@ -156,18 +165,21 @@ async def readback(context,state):
 
 
 async def publish(job_path,read_only=False):
+    if 'reddit' in DISABLED_PLATFORMS:return disabled_result('reddit')
     job_path=Path(job_path).resolve()
     if ROOT not in job_path.parents:raise ValueError('Reddit job must be inside media output')
     job=json.loads(job_path.read_text())
     username=job['username']
+    target=destination(job)
     if not re.fullmatch(r'[A-Za-z0-9_-]{3,20}',username):raise ValueError('Invalid own-profile target')
     path=ROOT/('native_reddit_'+job['key']+'.json')
     state=json.loads(path.read_text()) if path.exists() else {
-        'status':'new','username':username,'source_id':job['source_id'],
+        'status':'new','username':username,'target':target,'source_id':job['source_id'],
         'title':job['title'],'body':job['body'],'sha256':job.get('sha256'),
         'media_present':bool(job.get('video') or job.get('image')),
         'media_kind':'video' if job.get('video') else ('image' if job.get('image') else 'text'),'started_at':time.time()}
-    if state['username']!=username or state['source_id']!=job['source_id'] or state.get('sha256')!=job.get('sha256'):
+    if (state['username']!=username or not same(destination(state),target)
+            or state['source_id']!=job['source_id'] or state.get('sha256')!=job.get('sha256')):
         raise RuntimeError('Reddit receipt target or source mismatch')
     if state['status']=='published':return state
     if state['status']=='rejected_by_platform':raise PlatformRejected(state.get('last_error','Reddit rejected this post; no replacement sent'))
@@ -187,7 +199,7 @@ async def publish(job_path,read_only=False):
                 if read_only and not state.get('id'):
                     await discover(context,state);save(path,state)
                 if not state.get('id'):
-                    old_retry=(not raw and state['status']=='rejected_target_unavailable' and not state.get('old_submission_attempted_at'))
+                    old_retry=(target.startswith('u_') and not raw and state['status']=='rejected_target_unavailable' and not state.get('old_submission_attempted_at'))
                     upload_retry=raw and state['status']=='uploading' and never_submitted
                     if state['status']!='new' and not old_retry and not upload_retry:
                         raise RuntimeError('Reddit submission is uncertain; no replacement will be sent')
@@ -197,7 +209,7 @@ async def publish(job_path,read_only=False):
                     for previous in ROOT.glob('native_reddit_*.json'):
                         if not re.fullmatch(r'native_reddit_[a-f0-9]{64}\.json',previous.name):continue
                         other=json.loads(previous.read_text())
-                        if previous!=path and (other.get('username')==username and bool(other.get('media_present'))==bool(raw)
+                        if previous!=path and (other.get('username')==username and same(destination(other),target) and bool(other.get('media_present'))==bool(raw)
                                 and blocks_new_submission(other)):
                             raise RuntimeError('Another Reddit submission for this profile awaits readback')
                     if read_only:raise RuntimeError('Read-only reconciliation cannot create a post')
@@ -233,7 +245,7 @@ async def publish(job_path,read_only=False):
                 try:proof=await readback(anonymous,state)
                 finally:await anonymous.close()
                 state.update(status='published',url=proof['url'],public_verified_at=proof['verified_at'],
-                    verification='Exact title, complete body, own-profile author and media when attached in signed-in and anonymous browser')
+                    verification='Exact title, complete body, approved author, destination '+target+' and attached media in signed-in and anonymous browser')
                 save(path,state)
             except Exception as exc:
                 if isinstance(exc,PlatformRejected):
@@ -255,7 +267,9 @@ async def publish(job_path,read_only=False):
 async def submit_video(page,state,path,raw,username,media_kind='video'):
     await page.goto('https://www.reddit.com/user/'+username+'/submitted/',wait_until='domcontentloaded',timeout=30000)
     await expect(page.get_by_role('heading',name=username,exact=True).first).to_be_visible(timeout=20000)
-    await page.goto('https://www.reddit.com/user/'+username+'/submit',wait_until='domcontentloaded',timeout=30000)
+    await page.goto(home(state)+'/submit',wait_until='domcontentloaded',timeout=30000)
+    if destination(state).startswith('r_'):
+        await page.get_by_role('button',name='r/'+destination(state)[2:],exact=True).wait_for(timeout=20000)
     title=page.get_by_role('textbox',name=re.compile(r'^(Заголовок|Title)$'))
     body=page.locator('[contenteditable=true][name=body]')
     await title.fill(state['title']);await body.fill(state['body'])
@@ -284,13 +298,17 @@ async def submit_video(page,state,path,raw,username,media_kind='video'):
         else:await page.locator('shreddit-player[player-type=video_preview]').wait_for(timeout=180000)
     if await title.input_value()!=state['title'] or normalized(await body.inner_text())!=normalized(state['body']):
         raise RuntimeError('Reddit composer did not retain the reviewed text')
+    if destination(state).startswith('r_'):
+        await expect(page.get_by_role('button',name='r/'+destination(state)[2:],exact=True)).to_be_visible()
+        if urlparse(page.url).path.rstrip('/').casefold()!=('/r/'+destination(state)[2:]+'/submit').casefold():
+            raise RuntimeError('Reddit composer changed the approved community')
     button=page.get_by_role('button',name=re.compile(r'^(Опубликовать|Post)$'),exact=True)
     await expect(button).to_be_enabled(timeout=180000)
     def navigation(frame):
         if frame!=page.main_frame:return
         identity=post_id(frame.url)
         if identity:
-            state.update(id=identity,url='https://www.reddit.com/user/'+username+'/comments/'+identity+'/',last_url=frame.url)
+            state.update(id=identity,url=permalink(state,identity),last_url=frame.url)
             save(path,state)
     page.on('framenavigated',navigation)
     state.update(status='publishing',publication_attempted_at=time.time());save(path,state)
