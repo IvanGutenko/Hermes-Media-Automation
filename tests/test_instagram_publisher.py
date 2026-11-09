@@ -106,6 +106,33 @@ class PublisherSafetyTests(unittest.TestCase):
         state=self.run_publish(compose=compose,locate_and_verify=found)
         self.assertEqual(state['status'],'published');self.assertEqual(state['published_at'],70)
 
+    def test_an_account_with_a_stored_session_posts_from_its_own_context_and_keeps_rotated_cookies(self):
+        sessions=self.root/'sessions';sessions.mkdir()
+        (sessions/'instagram_thinkscope.hub.json').write_text('{"cookies":[],"origins":[]}')
+        browser=fake_browser();shared=browser.contexts[0]
+        own=MagicMock();own.new_page=AsyncMock(return_value=shared.new_page.return_value)
+        own.close=AsyncMock()
+        async def store(path):Path(path).write_text('{"cookies":["rotated"],"origins":[]}')
+        own.storage_state=AsyncMock(side_effect=store)
+        browser.new_context=AsyncMock(return_value=own)
+        used=[]
+        async def found(context,page,state,path):
+            used.append(context);state.update(code='NEW',url='https://www.instagram.com/reel/NEW/');ig.save(path,state)
+        async def compose(page,state,path,raw,dry_run):state.update(status='posted_unverified',share_attempted_at=70);ig.save(path,state)
+        with patch.object(ig,'SESSIONS',sessions):
+            state=self.run_publish(connect=AsyncMock(return_value=browser),compose=compose,locate_and_verify=found)
+        self.assertEqual(state['status'],'published');self.assertEqual(used,[own])
+        shared.new_page.assert_not_called();own.close.assert_awaited()
+        self.assertIn('rotated',(sessions/'instagram_thinkscope.hub.json').read_text())
+
+    def test_an_account_without_a_stored_session_uses_the_shared_profile(self):
+        browser=fake_browser();browser.new_context=AsyncMock()
+        async def found(context,page,state,path):state.update(code='NEW',url='https://www.instagram.com/reel/NEW/');ig.save(path,state)
+        async def compose(page,state,path,raw,dry_run):state.update(status='posted_unverified',share_attempted_at=70);ig.save(path,state)
+        with patch.object(ig,'SESSIONS',self.root/'missing'):
+            self.run_publish(connect=AsyncMock(return_value=browser),compose=compose,locate_and_verify=found)
+        browser.new_context.assert_not_called();browser.contexts[0].new_page.assert_awaited()
+
 
 class FakeLocator:
     def __init__(self,visible=lambda:False,on_click=None):

@@ -20,6 +20,9 @@ import instagram_format as fmt
 
 ROOT=Path('/data/output')
 SITE='https://www.instagram.com'
+# Most own accounts share the profile and its account switcher. An account that was signed in elsewhere keeps its
+# session here instead and works in an isolated browser context, so it never disturbs the switcher's accounts.
+SESSIONS=Path('/data/profile/factory_sessions')
 LOGIN_FIELDS='input[name=username],input[name=email],input[name=pass],input[name=password]'
 LOGIN_NAME=re.compile(r'^(Log in|Войти)$',re.I)
 ACK=re.compile(r'(Your (post|reel) has been shared|Ваша публикация опубликована|Ваш клип опубликован|Ваш reels опубликован|опубликован)',re.I)
@@ -122,6 +125,26 @@ async def switch_account(page,username):
     await row.click()
     await expect(chooser).not_to_be_visible(timeout=30000)
     await page.wait_for_timeout(1500)
+
+
+def session_file(username):
+    return SESSIONS/('instagram_'+username.casefold()+'.json')
+
+
+async def account_context(browser,username):
+    """(context, isolated): the account's own stored session when it has one, otherwise the browser profile's."""
+    if session_file(username).exists():
+        return await browser.new_context(storage_state=str(session_file(username))),True
+    return browser.contexts[0],False
+
+
+async def close_account_context(context,username):
+    """Keep the cookies Instagram rotated during the run, and leave nothing of the account in the browser."""
+    try:
+        target=session_file(username);temp=target.with_suffix('.tmp')
+        await context.storage_state(path=str(temp))
+        temp.chmod(0o600);temp.replace(target)
+    finally:await context.close()
 
 
 async def ensure_signed_in(page,username):
@@ -370,9 +393,9 @@ async def publish(job_path,read_only=False,dry_run=False):
     with (ROOT/'.flow-generation.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         async with async_playwright() as p:
-            browser=await connect(p);page=None
+            browser=await connect(p);page=None;isolated=False
             try:
-                context=browser.contexts[0]
+                context,isolated=await account_context(browser,username)
                 page=await context.new_page()
                 network_events=[]
                 def record_response(response):
@@ -415,6 +438,7 @@ async def publish(job_path,read_only=False,dry_run=False):
                 raise
             finally:
                 if page:await page.close()
+                if isolated:await close_account_context(context,username)
                 await browser.close()
     return state
 
