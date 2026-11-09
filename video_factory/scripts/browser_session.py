@@ -23,8 +23,8 @@ async def set_frozen(page, frozen):
 
 
 async def connect(playwright):
-    from browser_tabs import http_tidy
-    try:await asyncio.wait_for(asyncio.to_thread(http_tidy),15)
+    from browser_tabs import http_tidy,HTTP_BUDGET
+    try:await asyncio.wait_for(asyncio.to_thread(http_tidy),HTTP_BUDGET+5)
     except Exception:pass
     for attempt in range(3):
         try:

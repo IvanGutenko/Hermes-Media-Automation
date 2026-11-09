@@ -313,5 +313,48 @@ class CompletedEditors(unittest.TestCase):
             (root/'flow_pending.json').write_text(json.dumps({'status':'submitted','project_url':url}))
             self.assertEqual(browser_tabs.completed_editor_urls(root),set())
 
+    def test_an_open_image_editor_that_no_receipt_names_is_released(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);folder=root/'post_images/key/pics0';folder.mkdir(parents=True)
+            named='https://docs.google.com/images/d/named/edit'
+            orphan='https://docs.google.com/images/d/orphan/edit'
+            (folder/'pics_receipt.json').write_text(json.dumps({'status':'submitted','document_url':named+'?authuser=0'}))
+            # Evidence files name pages too, but nothing resumes from them.
+            (folder/'last_ui.json').write_text(json.dumps({'url':orphan}))
+            self.assertEqual(browser_tabs.completed_editor_urls(root,open_urls=[named,orphan]),{orphan})
+            # Without the list of open pages nothing is declared orphaned.
+            self.assertEqual(browser_tabs.completed_editor_urls(root),set())
+            # Only Pics editors: a Vids document or a Flow project is never released by absence.
+            other=['https://docs.google.com/videos/d/x/edit','https://flow.google.com/u/0/project/x']
+            self.assertEqual(browser_tabs.completed_editor_urls(root,open_urls=other),set())
+            # A receipt that cannot be read might be the one naming the editor.
+            broken=root/'post_images/other/pics0';broken.mkdir(parents=True)
+            (broken/'pics_receipt.json').write_text('{"status":')
+            self.assertEqual(browser_tabs.completed_editor_urls(root,open_urls=[named,orphan]),set())
+
+    def test_only_receipts_of_services_with_open_pages_are_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'post_images').mkdir()
+            (root/'flow_broken.json').write_text('{"status":')
+            orphan='https://docs.google.com/images/d/orphan/edit'
+            # A Flow receipt cannot name a Pics document, so it is not even opened
+            # (had it been read, being unreadable would have withheld the release).
+            self.assertEqual(browser_tabs.completed_editor_urls(root,open_urls=[orphan]),{orphan})
+            # With a Flow page open the unreadable Flow receipt is read and reported.
+            flow='https://flow.google.com/u/0/project/x'
+            self.assertEqual(browser_tabs.completed_editor_urls(root,open_urls=[flow,orphan]),set())
+
+    def test_without_visible_receipts_no_image_editor_counts_as_orphaned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            url='https://docs.google.com/images/d/pending/edit'
+            self.assertEqual(browser_tabs.completed_editor_urls(Path(tmp),open_urls=[url]),set())
+
+
+class DzenTabs(unittest.TestCase):
+    def test_the_editor_landing_is_a_dashboard_but_a_draft_is_kept(self):
+        self.assertTrue(browser_tabs.disposable('https://dzen.ru/profile/editor/id/6a6f8db6fad4763cdb24fba1'))
+        self.assertFalse(browser_tabs.disposable('https://dzen.ru/profile/editor/id/6a6f8db6fad4763cdb24fba1/6a70aa11bb22cc33dd44ee55/edit'))
+        self.assertFalse(browser_tabs.disposable('https://dzen.ru/profile/editor/article/unfinished'))
+
 
 if __name__ == "__main__":unittest.main()

@@ -13,6 +13,11 @@ from urllib.parse import urlsplit
 from urllib.request import build_opener,ProxyHandler
 
 PARK='https://myaccount.google.com/'
+# Measured 2026-11-09 with the container at its memory limit: Chrome answered
+# /json/list after 13 s, later not within 25 s. A 10 s budget gave up every time, so tabs piled up
+# exactly when memory was short. The budget covers Chrome's answers, not the
+# receipt reads; a caller that stops waiting leaves the thread to finish.
+HTTP_BUDGET=60
 
 
 def owner_connected():
@@ -57,16 +62,24 @@ def completed_editor_urls(root=None, open_urls=None):
     """
     import hashlib
     root=Path('/data/output') if root is None else Path(root)
-    candidates=[]
-    for pattern in ('flow_*.json','vids_*.json','post_images/**/pics_receipt.json'):
-        candidates.extend(root.glob(pattern))
     wanted=None if open_urls is None else {u.split("?")[0].rstrip("/") for u in open_urls}
-    completed=set();pending=set()
+    # Receipts can only name pages of their own service. Under memory pressure
+    # (2026-11-09) reading all ~1000 of them took 98 s, so read only the kinds
+    # whose service has an open page.
+    hosts=None if wanted is None else {urlsplit(u).hostname for u in wanted}
+    patterns=[]
+    if hosts is None or 'flow.google.com' in hosts:patterns.append('flow_*.json')
+    if hosts is None or 'docs.google.com' in hosts:patterns+=['vids_*.json','post_images/**/pics_receipt.json']
+    candidates=[]
+    for pattern in patterns:
+        candidates.extend(root.glob(pattern))
+    completed=set();pending=set();named=set();unread=False
     for path in candidates:
         try:receipt=json.loads(path.read_text())
-        except (OSError,ValueError):continue
+        except (OSError,ValueError):unread=True;continue
         urls={receipt.get(k,'').split('?')[0].rstrip('/') for k in ('document_url','doc_url','project_url') if isinstance(receipt.get(k),str)}
         urls={u for u in urls if urlsplit(u).hostname in ('docs.google.com','flow.google.com')}
+        named|=urls
         if wanted is not None:urls &= wanted
         if not urls:continue
         if receipt.get('status') in ('empty_document_after_submission','result_lost_before_confirmation'):
@@ -97,7 +110,16 @@ def completed_editor_urls(root=None, open_urls=None):
                 for chunk in iter(lambda:stream.read(1024*1024),b''):digest.update(chunk)
             if digest.hexdigest()==receipt['sha256']:completed.update(urls)
         except OSError:continue
-    return completed-pending
+    # Pics resumes only the document its receipt names, and every retry before
+    # that name is saved opens a fresh one. An open Pics editor that no receipt
+    # names was left by such an attempt: nothing was submitted there and no job
+    # can come back to it. Cleanup runs under the browser lease, so no job is
+    # between creating a document and recording it. Absence proves nothing when
+    # the receipts are not visible or one of them could not be read.
+    visible=(root/'post_images').is_dir() and not unread
+    orphans={u for u in (wanted if visible else ()) or () if urlsplit(u).hostname=='docs.google.com'
+        and re.fullmatch(r'/images/d/[^/]+/edit',urlsplit(u).path) and u not in named}
+    return (completed-pending)|orphans
 
 
 def disposable(url, protect_studio=False,protected_sites=(),completed_editors=()):
@@ -110,7 +132,8 @@ def disposable(url, protect_studio=False,protected_sites=(),completed_editors=()
         return path in ('/','/account','/account_advanced','/results','/watch') or path.startswith(('/@','/channel/','/shorts/','/feed/'))
     if host=='studio.youtube.com':
         return not protect_studio and path.startswith('/channel/') and '/video/' not in path and '/upload' not in path
-    if host in ('dzen.ru','www.dzen.ru'):return path in ('','/')
+    if host in ('dzen.ru','www.dzen.ru'):
+        return path in ('','/') or bool(re.fullmatch(r'/profile/editor/id/[A-Za-z0-9]+/?',path))
     if host in ('vk.com','vk.ru','www.vk.com','www.vk.ru'):
         return bool(re.fullmatch(r'/(?:club|public)\d+/?',path)) or path in ('','/')
     return False
@@ -131,19 +154,22 @@ def http_tidy(fetch=None, owner=None):
         except OSError:pass
         return value
     if (owner_connected() if owner is None else owner):return report({'status':'owner_connected','closed_count':0})
-    deadline=time.monotonic()+10
+    deadline=time.monotonic()+HTTP_BUDGET
     if fetch is None:
         opener=build_opener(ProxyHandler({}))
         def fetch(path):
             remaining=deadline-time.monotonic()
             if remaining<=0:raise TimeoutError('cleanup time budget exhausted')
-            with opener.open('http://127.0.0.1:9222'+path,timeout=min(2,remaining)) as response:return response.read().decode()
+            with opener.open('http://127.0.0.1:9222'+path,timeout=remaining) as response:return response.read().decode()
     try:before=json.loads(fetch('/json/list'))
     except Exception as exc:return report({'status':'unavailable','closed_count':0,'error':type(exc).__name__})
     pages=[p for p in before if p.get('type')=='page']
     protect=pending_studio()
     protected_sites=pending_sites()
     completed_editors=completed_editor_urls(open_urls=[p.get("url","") for p in pages])
+    # The budget is for Chrome's answers; slow receipt reads must not use it up
+    # before the first close is even requested.
+    deadline=time.monotonic()+HTTP_BUDGET
     candidates=[p for p in pages if disposable(p.get('url',''),protect,protected_sites,completed_editors)]
     # Leave the final window alive even when it contains only old dashboards.
     if len(candidates)==len(pages) and candidates:candidates=candidates[1:]

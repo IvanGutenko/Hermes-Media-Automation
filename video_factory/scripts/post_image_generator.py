@@ -179,7 +179,11 @@ async def generate(job_path,wait_browser=0):
                 state.update(error=type(exc).__name__+': '+str(exc)[-600:],checked_at=time.time());save(receipt,state)
                 if page:
                     save(folder/'last_ui.json',{'url':page.url,'snapshot':await page.locator('body').aria_snapshot()})
-                    if state.get('status') in ('empty_document_after_submission','result_lost_before_confirmation','provider_unavailable'):
+                    # Only the receipt's own document is ever resumed; any other
+                    # editor this attempt opened is unreachable and only holds memory.
+                    recorded=state.get('document_url','').split('?')[0]
+                    if (not recorded or recorded not in page.url or state.get('status') in
+                            ('empty_document_after_submission','result_lost_before_confirmation','provider_unavailable')):
                         await page.close()
                 raise
             finally:await browser.close()

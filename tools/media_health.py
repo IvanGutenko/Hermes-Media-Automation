@@ -52,9 +52,9 @@ def park_idle_browser():
     from browser_process import run
     code='''import asyncio,sys
 sys.path.insert(0,'/app/scripts')
-from browser_tabs import tidy,http_tidy
+from browser_tabs import tidy,http_tidy,HTTP_BUDGET
 async def main():
- try:bootstrap=await asyncio.wait_for(asyncio.to_thread(http_tidy),15)
+ try:bootstrap=await asyncio.wait_for(asyncio.to_thread(http_tidy),HTTP_BUDGET+5)
  except Exception:bootstrap={}
  from playwright.async_api import async_playwright
  async with async_playwright() as p:
@@ -64,7 +64,7 @@ async def main():
   print(report['touched_count']+bootstrap.get('closed_count',0))
 asyncio.run(main())'''
     try:
-        result=run(['docker','exec','video_factory_auth','python3','-c',code],capture_output=True,text=True,timeout=60)
+        result=run(['docker','exec','video_factory_auth','python3','-c',code],capture_output=True,text=True,timeout=110)
         save(BASE_DIR/'output/browser_cleanup_attempt.json',{'checked_at':time.time(),'returncode':result.returncode,
             'error':result.stderr[-1800:] if result.returncode else None})
         return int(result.stdout.strip().splitlines()[-1]) if result.returncode==0 and result.stdout.strip() else 0

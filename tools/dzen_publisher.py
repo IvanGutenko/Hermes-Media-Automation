@@ -145,6 +145,11 @@ async def publish(folder,wait_browser_seconds=0):
                         snapshot=await asyncio.wait_for(page.locator('body').aria_snapshot(),timeout=5)
                         save(folder/'last_ui.json',{'url':page.url,'snapshot':snapshot})
                     except Exception:pass
+                    # A recorded draft is resumed in its own tab. Without one the
+                    # next attempt opens a fresh editor, so this tab would only pile up.
+                    if not (state.get('editor_url') and state['editor_url'].split('?')[0] in page.url):
+                        try:await asyncio.wait_for(page.close(),5)
+                        except Exception:pass
                 raise
             finally:
                 await browser.close()
